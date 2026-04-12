@@ -71,6 +71,61 @@ ollama-reload() {
   ollama-restart
 }
 
+_llama_endpoint() {
+  printf 'http://%s:%s\n' "$LLAMA_CPP_HOST" "$LLAMA_CPP_PORT"
+}
+
+_llama_model_path() {
+  local model="$1"
+  printf '%s/%s\n' "$LLAMA_CPP_MODELS" "$model"
+}
+
+_llama_require_model() {
+  local model="$1"
+  local model_path
+
+  if [ -z "$model" ]; then
+    return 1
+  fi
+
+  model_path="$(_llama_model_path "$model")"
+
+  if [ ! -e "$model_path" ]; then
+    echo "Model not found: $model_path"
+    return 1
+  fi
+
+  printf '%s\n' "$model_path"
+}
+
+_llama_print_content() {
+  local response="$1"
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$response" | jq -r '.choices[0].message.content // empty'
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$response" | python3 -c 'import json, sys; data = json.load(sys.stdin); print(data.get("choices", [{}])[0].get("message", {}).get("content", ""))'
+    return 0
+  fi
+
+  printf '%s\n' "$response"
+}
+
+_llama_escape_json() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+
+  printf '%s\n' "$value"
+}
+
 llama-src() {
   cd "$LLAMA_CPP_SRC" || return 1
 }
@@ -106,6 +161,7 @@ llama-update() {
 
 llama-cli-local() {
   local model="$1"
+  local model_path
   shift || true
 
   if [ -z "$model" ]; then
@@ -113,18 +169,14 @@ llama-cli-local() {
     return 1
   fi
 
-  local model_path="$LLAMA_CPP_MODELS/$model"
-
-  if [ ! -e "$model_path" ]; then
-    echo "Model not found: $model_path"
-    return 1
-  fi
+  model_path="$(_llama_require_model "$model")" || return 1
 
   llama-cli -m "$model_path" "$@"
 }
 
 llama-server-local() {
   local model="$1"
+  local model_path
   shift || true
 
   if [ -z "$model" ]; then
@@ -132,12 +184,7 @@ llama-server-local() {
     return 1
   fi
 
-  local model_path="$LLAMA_CPP_MODELS/$model"
-
-  if [ ! -e "$model_path" ]; then
-    echo "Model not found: $model_path"
-    return 1
-  fi
+  model_path="$(_llama_require_model "$model")" || return 1
 
   llama-server \
     -m "$model_path" \
@@ -148,6 +195,7 @@ llama-server-local() {
 
 llama-bench-local() {
   local model="$1"
+  local model_path
   shift || true
 
   if [ -z "$model" ]; then
@@ -155,30 +203,22 @@ llama-bench-local() {
     return 1
   fi
 
-  local model_path="$LLAMA_CPP_MODELS/$model"
-
-  if [ ! -e "$model_path" ]; then
-    echo "Model not found: $model_path"
-    return 1
-  fi
+  model_path="$(_llama_require_model "$model")" || return 1
 
   llama-bench -m "$model_path" "$@"
 }
 
 llama-start() {
   local model="${1:-$LLAMA_CPP_DEFAULT_MODEL}"
+  local model_path
   shift || true
 
-  local model_path="$LLAMA_CPP_MODELS/$model"
-
   mkdir -p "$LLAMA_CPP_MODELS" "$LLAMA_CPP_CACHE" "$LLAMA_CPP_LOGS"
-
-  if [ ! -e "$model_path" ]; then
-    echo "Model not found: $model_path"
+  model_path="$(_llama_require_model "$model")" || {
     echo "Available models:"
     llama-models
     return 1
-  fi
+  }
 
   llama-stop >/dev/null 2>&1 || true
 
@@ -200,14 +240,23 @@ llama-stop() {
 }
 
 llama-status() {
+  local endpoint="$(_llama_endpoint)"
+
+  mkdir -p "$LLAMA_CPP_MODELS" "$LLAMA_CPP_CACHE" "$LLAMA_CPP_LOGS"
+
   echo "LLAMA_CPP_SRC:           $LLAMA_CPP_SRC"
   echo "LLAMA_CPP_BIN:           $LLAMA_CPP_BIN"
+  echo "LLAMA_CPP_ROOT:          $LLAMA_CPP_ROOT"
   echo "LLAMA_CPP_MODELS:        $LLAMA_CPP_MODELS"
   echo "LLAMA_CPP_CACHE:         $LLAMA_CPP_CACHE"
+  echo "LLAMA_CACHE:             $LLAMA_CACHE"
   echo "LLAMA_CPP_DEFAULT_MODEL: $LLAMA_CPP_DEFAULT_MODEL"
+  echo "LLAMA_CPP_SERVER_ALIAS:  $LLAMA_CPP_SERVER_ALIAS"
+  echo "LLAMA_CPP_HOST:          $LLAMA_CPP_HOST"
+  echo "LLAMA_CPP_PORT:          $LLAMA_CPP_PORT"
   echo "LLAMA_CPP_LOGS:          $LLAMA_CPP_LOGS"
-  echo "LLAMA_CPP_ENDPOINT:      http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT"
-  curl -fsS "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/" >/dev/null && echo "llama.cpp API: up" || echo "llama.cpp API: down"
+  echo "LLAMA_CPP_ENDPOINT:      $endpoint"
+  curl -fsS "$endpoint/" >/dev/null && echo "llama.cpp API: up" || echo "llama.cpp API: down"
 }
 
 llama-logs() {
@@ -215,9 +264,101 @@ llama-logs() {
 }
 
 llama-api-test() {
-  curl -fsS "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/chat/completions" \
+  curl -fsS "$(_llama_endpoint)/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{"model":"'"$LLAMA_CPP_SERVER_ALIAS"'","messages":[{"role":"user","content":"Say hello in one short sentence."}]}'
+}
+
+hf-login() {
+  hf auth login
+}
+
+hf-search() {
+  if [ -z "$1" ]; then
+    echo "Usage: hf-search <query>"
+    return 1
+  fi
+
+  hf models ls --search "$1"
+}
+
+llama-pull() {
+  local repo="$1"
+  local target="${2:-}"
+
+  if [ -z "$repo" ]; then
+    echo "Usage: llama-pull <hf-repo> [target-dir]"
+    return 1
+  fi
+
+  if [ -z "$target" ]; then
+    target="$LLAMA_CPP_MODELS/${repo##*/}"
+  fi
+
+  mkdir -p "$target"
+  hf download "$repo" --local-dir "$target"
+}
+
+llama-pull-file() {
+  local repo="$1"
+  local file="$2"
+  local target
+
+  if [ -z "$repo" ] || [ -z "$file" ]; then
+    echo "Usage: llama-pull-file <hf-repo> <filename.gguf>"
+    return 1
+  fi
+
+  target="$LLAMA_CPP_MODELS/${repo##*/}"
+  mkdir -p "$target"
+  hf download "$repo" "$file" --local-dir "$target"
+}
+
+llama-list() {
+  llama-models
+}
+
+llama-run() {
+  llama-start "$@"
+}
+
+llama-pick() {
+  local selected
+
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is required for llama-pick"
+    return 1
+  fi
+
+  selected="$(llama-list | sed "s#^$LLAMA_CPP_MODELS/##" | fzf --height 50% --layout=reverse --border --prompt='llama model > ')" || return 1
+  [ -n "$selected" ] || return 1
+  llama-start "$selected"
+}
+
+llama-chat() {
+  local prompt="${*:-Say hello in one short sentence.}"
+  local escaped_prompt
+  local response
+
+  escaped_prompt="$(_llama_escape_json "$prompt")"
+  response="$(
+    curl -fsS "$(_llama_endpoint)/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -d '{"model":"'"$LLAMA_CPP_SERVER_ALIAS"'","messages":[{"role":"user","content":"'"$escaped_prompt"'"}]}'
+  )" || return 1
+
+  _llama_print_content "$response"
+}
+
+llama-clean() {
+  mkdir -p "$LLAMA_CPP_CACHE"
+
+  if [ -z "$LLAMA_CPP_CACHE" ] || [ "$LLAMA_CPP_CACHE" = "/" ]; then
+    echo "Refusing to clean invalid cache path"
+    return 1
+  fi
+
+  find "$LLAMA_CPP_CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
 
 run-gemma4-e4b() {

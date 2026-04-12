@@ -15,6 +15,10 @@ if [ -x /opt/homebrew/bin/brew ]; then
   eval "$(/opt/homebrew/bin/brew shellenv)"
 fi
 
+if [ -n "$ZSH_VERSION" ]; then
+  typeset -U path PATH
+fi
+
 export WORKSSD="/Volumes/WorkSSD"
 export DEV_STORAGE="$HOME/DevStorage"
 
@@ -28,9 +32,27 @@ else
   export DEV_STORAGE_MODE="local"
 fi
 
-export PATH="$HOME/bin:$HOME/.local/bin:$DEV_STORAGE/bin:$PATH"
-export PATH="$PATH:$HOME/.lmstudio/bin"
-export PATH="$HOME/.opencode/bin:$PATH"
+if [ -n "$ZSH_VERSION" ]; then
+  path=(
+    "$HOME/.opencode/bin"
+    "$HOME/bin"
+    "$HOME/.local/bin"
+    "$DEV_STORAGE/bin"
+    $path
+  )
+
+  if [ -d "$HOME/.lmstudio/bin" ]; then
+    path+=("$HOME/.lmstudio/bin")
+  fi
+
+  export PATH
+else
+  export PATH="$HOME/.opencode/bin:$HOME/bin:$HOME/.local/bin:$DEV_STORAGE/bin:$PATH"
+
+  if [ -d "$HOME/.lmstudio/bin" ]; then
+    export PATH="$PATH:$HOME/.lmstudio/bin"
+  fi
+fi
 
 export HOMEBREW_CACHE="$DEV_STORAGE/cache/brew"
 export PIP_CACHE_DIR="$DEV_STORAGE/cache/pip"
@@ -64,11 +86,21 @@ export LLAMA_CPP_SERVER_ALIAS="local"
 export LLAMA_CACHE="$LLAMA_CPP_CACHE"
 
 if [ -d "$LLAMA_CPP_BIN" ]; then
-  export PATH="$LLAMA_CPP_BIN:$PATH"
+  if [ -n "$ZSH_VERSION" ]; then
+    path=("$LLAMA_CPP_BIN" $path)
+    export PATH
+  else
+    export PATH="$LLAMA_CPP_BIN:$PATH"
+  fi
 fi
 
 export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
+if [ -n "$ZSH_VERSION" ]; then
+  path=("$BUN_INSTALL/bin" $path)
+  export PATH
+else
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
 
 mkdir -p \
   "$HOME/.cache/zsh" \

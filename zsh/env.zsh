@@ -80,7 +80,7 @@ export LLAMA_CPP_LOGS="$DEV_STORAGE/logs/llama.cpp"
 
 export LLAMA_CPP_HOST="127.0.0.1"
 export LLAMA_CPP_PORT="8080"
-export LLAMA_CPP_DEFAULT_MODEL="gemma-3-4b-it-Q4_K_M.gguf"
+export LLAMA_CPP_DEFAULT_MODEL="gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
 export LLAMA_CPP_SERVER_ALIAS="local"
 
 export LLAMA_CACHE="$LLAMA_CPP_CACHE"

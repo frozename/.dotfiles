@@ -162,7 +162,9 @@ llama-update() {
 llama-cli-local() {
   local model="$1"
   local model_path
-  shift || true
+  if [ $# -gt 0 ]; then
+    shift
+  fi
 
   if [ -z "$model" ]; then
     echo "Usage: llama-cli-local <relative-model-path> [extra llama-cli args]"
@@ -177,7 +179,9 @@ llama-cli-local() {
 llama-server-local() {
   local model="$1"
   local model_path
-  shift || true
+  if [ $# -gt 0 ]; then
+    shift
+  fi
 
   if [ -z "$model" ]; then
     echo "Usage: llama-server-local <relative-model-path> [extra llama-server args]"
@@ -196,7 +200,9 @@ llama-server-local() {
 llama-bench-local() {
   local model="$1"
   local model_path
-  shift || true
+  if [ $# -gt 0 ]; then
+    shift
+  fi
 
   if [ -z "$model" ]; then
     echo "Usage: llama-bench-local <relative-model-path> [extra llama-bench args]"
@@ -215,7 +221,9 @@ llama-start() {
   local pid
   local http_code=""
   local attempt=0
-  shift || true
+  if [ $# -gt 0 ]; then
+    shift
+  fi
 
   mkdir -p "$LLAMA_CPP_MODELS" "$LLAMA_CPP_CACHE" "$LLAMA_CPP_LOGS"
   model_path="$(_llama_require_model "$model")" || {

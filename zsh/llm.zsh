@@ -210,7 +210,11 @@ llama-bench-local() {
 
 llama-start() {
   local model="${1:-$LLAMA_CPP_DEFAULT_MODEL}"
+  local health_endpoint="$(_llama_endpoint)/health"
   local model_path
+  local pid
+  local http_code=""
+  local attempt=0
   shift || true
 
   mkdir -p "$LLAMA_CPP_MODELS" "$LLAMA_CPP_CACHE" "$LLAMA_CPP_LOGS"
@@ -230,9 +234,33 @@ llama-start() {
     -ngl 999 \
     -fa on \
     "$@" > "$LLAMA_CPP_LOGS/server.log" 2>&1 &
+  pid=$!
 
-  sleep 2
-  llama-status
+  while [ "$attempt" -lt 60 ]; do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      echo "llama.cpp exited early"
+      tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+      return 1
+    fi
+
+    http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
+
+    case "$http_code" in
+      200)
+        llama-status
+        return 0
+        ;;
+      503)
+        ;;
+    esac
+
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+
+  echo "llama.cpp readiness check timed out"
+  tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+  return 1
 }
 
 llama-stop() {
@@ -241,6 +269,9 @@ llama-stop() {
 
 llama-status() {
   local endpoint="$(_llama_endpoint)"
+  local health_endpoint="$endpoint/health"
+  local http_code=""
+  local state="down"
 
   mkdir -p "$LLAMA_CPP_MODELS" "$LLAMA_CPP_CACHE" "$LLAMA_CPP_LOGS"
 
@@ -256,7 +287,19 @@ llama-status() {
   echo "LLAMA_CPP_PORT:          $LLAMA_CPP_PORT"
   echo "LLAMA_CPP_LOGS:          $LLAMA_CPP_LOGS"
   echo "LLAMA_CPP_ENDPOINT:      $endpoint"
-  curl -fsS "$endpoint/" >/dev/null && echo "llama.cpp API: up" || echo "llama.cpp API: down"
+
+  http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
+
+  case "$http_code" in
+    200)
+      state="ready"
+      ;;
+    503)
+      state="loading"
+      ;;
+  esac
+
+  echo "llama.cpp API:           $state"
 }
 
 llama-logs() {
@@ -315,7 +358,12 @@ llama-pull-file() {
 }
 
 llama-list() {
-  llama-models
+  mkdir -p "$LLAMA_CPP_MODELS"
+  find "$LLAMA_CPP_MODELS" -type f \( -iname '*.gguf' -o -iname '*.gguf-split*' \) \
+    ! -iname 'mmproj*.gguf' \
+    ! -iname '*mmproj*' \
+    ! -iname '*vision*' \
+    ! -iname '*proj*' | sort
 }
 
 llama-run() {

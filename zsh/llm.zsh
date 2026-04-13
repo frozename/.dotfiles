@@ -427,9 +427,65 @@ run-gemma4-e4b() {
     --chat-template-kwargs '{"enable_thinking":false}'
 }
 
+_llama_switch_default_model() {
+  local model="$1"
+  local model_path
+
+  if [ -z "$model" ]; then
+    echo "Usage: _llama_switch_default_model <relative-model-path>"
+    return 1
+  fi
+
+  model_path="$LLAMA_CPP_MODELS/$model"
+
+  if [ ! -e "$model_path" ]; then
+    echo "Model not found: $model_path"
+    return 1
+  fi
+
+  export LLAMA_CPP_DEFAULT_MODEL="$model"
+  echo "LLAMA_CPP_DEFAULT_MODEL -> $LLAMA_CPP_DEFAULT_MODEL"
+}
+
+llama-use() {
+  case "$1" in
+    26b|gemma4-26b|gemma-4-26b)
+      _llama_switch_default_model "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    31b|gemma4-31b|gemma-4-31b)
+      _llama_switch_default_model "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    current|"")
+      echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
+      ;;
+    *)
+      echo "Usage: llama-use {26b|31b|current}"
+      return 1
+      ;;
+  esac
+}
+
+llama-use-26b() {
+  llama-use 26b
+}
+
+llama-use-31b() {
+  llama-use 31b
+}
+
 run-gemma4-26b() {
   llama-start "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf" \
     --mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF/mmproj-BF16.gguf" \
+    --ctx-size 32768 \
+    --temp 1.0 \
+    --top-p 0.95 \
+    --top-k 64 \
+    --chat-template-kwargs '{"enable_thinking":false}'
+}
+
+run-gemma4-31b() {
+  llama-start "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf" \
+    --mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF/mmproj-BF16.gguf" \
     --ctx-size 32768 \
     --temp 1.0 \
     --top-p 0.95 \

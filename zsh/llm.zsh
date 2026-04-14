@@ -443,45 +443,20 @@ llama-clean() {
   find "$LLAMA_CPP_CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
 
-run-gemma4-e4b() {
-  local model_dir="$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF"
-  local model=""
-  local mmproj=""
+_llama_start_gemma4_model() {
+  local rel="$1"
+  local model_dir="$2"
+  local label="$3"
+  local mmproj
 
-  for candidate in \
-    "gemma-4-E4B-it-Q8_0.gguf" \
-    "gemma-4-E4B-it-UD-Q5_K_XL.gguf" \
-    "gemma-4-E4B-it-UD-Q4_K_XL.gguf" \
-    "gemma-4-E4B-it-Q6_K.gguf" \
-    "gemma-4-E4B-it-Q5_K_M.gguf" \
-    "gemma-4-E4B-it-Q4_K_M.gguf"
-  do
-    if [ -f "$model_dir/$candidate" ]; then
-      model="gemma-4-E4B-it-GGUF/$candidate"
-      break
-    fi
-  done
+  _local_ai_ensure_model_assets "$rel" || return 1
 
-  if [ -z "$model" ]; then
-    echo "No Gemma 4 E4B model found under $model_dir"
-    echo "Try: gemma4-e4b-pull q8"
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/$model_dir")" || {
+    echo "No $label mmproj file found under $LLAMA_CPP_MODELS/$model_dir"
     return 1
-  fi
+  }
 
-  for candidate in "mmproj-BF16.gguf" "mmproj-F16.gguf"; do
-    if [ -f "$model_dir/$candidate" ]; then
-      mmproj="$model_dir/$candidate"
-      break
-    fi
-  done
-
-  if [ -z "$mmproj" ]; then
-    echo "No Gemma 4 E4B mmproj file found under $model_dir"
-    echo "Try: gemma4-e4b-pull q8"
-    return 1
-  fi
-
-  llama-start "$model" \
+  llama-start "$rel" \
     --mmproj "$mmproj" \
     --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 1.0 \
@@ -490,8 +465,36 @@ run-gemma4-e4b() {
     --chat-template-kwargs '{"enable_thinking":false}'
 }
 
+_llama_default_e4b_model() {
+  local model_dir="$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF"
+  local candidate
+
+  for candidate in \
+    "gemma-4-E4B-it-Q8_0.gguf" \
+    "gemma-4-E4B-it-UD-Q5_K_XL.gguf" \
+    "gemma-4-E4B-it-UD-Q4_K_XL.gguf" \
+    "gemma-4-E4B-it-UD-Q6_K_XL.gguf" \
+    "gemma-4-E4B-it-Q5_K_M.gguf" \
+    "gemma-4-E4B-it-Q4_K_M.gguf"
+  do
+    if [ -f "$model_dir/$candidate" ]; then
+      printf '%s\n' "gemma-4-E4B-it-GGUF/$candidate"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+}
+
+run-gemma4-e4b() {
+  local model="${1:-$(_llama_default_e4b_model)}"
+
+  _llama_start_gemma4_model "$model" "gemma-4-E4B-it-GGUF" "Gemma 4 E4B"
+}
+
 _llama_find_mmproj() {
   local model_dir="$1"
+  local candidate
 
   for candidate in "mmproj-BF16.gguf" "mmproj-F16.gguf"; do
     if [ -f "$model_dir/$candidate" ]; then
@@ -570,6 +573,12 @@ _llama_switch_default_model() {
   fi
 
   export LLAMA_CPP_DEFAULT_MODEL="$model"
+  LOCAL_AI_SOURCE_MODEL="$model"
+
+  if typeset -f _local_ai_sync_env >/dev/null 2>&1; then
+    _local_ai_sync_env >/dev/null 2>&1 || true
+  fi
+
   echo "LLAMA_CPP_DEFAULT_MODEL -> $LLAMA_CPP_DEFAULT_MODEL"
 }
 
@@ -604,6 +613,11 @@ llama-profile() {
 
   model="$(_llama_recommended_model_for_profile "$LLAMA_CPP_MACHINE_PROFILE")"
   export LLAMA_CPP_DEFAULT_MODEL="$model"
+  LOCAL_AI_SOURCE_MODEL="$model"
+
+  if typeset -f _local_ai_sync_env >/dev/null 2>&1; then
+    _local_ai_sync_env >/dev/null 2>&1 || true
+  fi
 
   echo "LLAMA_CPP_MACHINE_PROFILE=$LLAMA_CPP_MACHINE_PROFILE"
   echo "LLAMA_CPP_GEMMA_CTX_SIZE=$LLAMA_CPP_GEMMA_CTX_SIZE"
@@ -622,22 +636,63 @@ llama-profile-desktop() {
   llama-profile macbook-pro
 }
 
+llama-switch() {
+  local target="${1:-current}"
+  local rel=""
+
+  case "$target" in
+    current)
+      _local_ai_run_llama_cpp_source "$(_local_ai_source_model)"
+      ;;
+    best|quality|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
+      rel="$(_local_ai_resolve_model_target "$target")" || return 1
+      if _local_ai_is_named_preset "$target"; then
+        _local_ai_ensure_model_assets "$rel" || return 1
+      fi
+      _llama_switch_default_model "$rel" || return 1
+      _local_ai_run_llama_cpp_source "$rel"
+      ;;
+    *)
+      echo "Usage: llama-switch {best|balanced|fast|31b|26b|e4b|qwen27|current|<relative-model-path>}"
+      return 1
+      ;;
+  esac
+}
+
+llama-switch-best() {
+  llama-switch best
+}
+
+llama-switch-balanced() {
+  llama-switch balanced
+}
+
+llama-switch-fast() {
+  llama-switch fast
+}
+
 llama-use() {
-  case "$1" in
-    best|quality|31b|gemma4-31b|gemma-4-31b)
-      _llama_switch_default_model "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+  local target="$1"
+  local apply_now="$2"
+  local rel=""
+
+  case "$apply_now" in
+    now|run|switch)
+      llama-switch "$target"
+      return $?
       ;;
-    balanced|daily|26b|gemma4-26b|gemma-4-26b)
-      _llama_switch_default_model "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
-      ;;
-    fast|small|e4b|gemma4-e4b|gemma-4-e4b)
-      _llama_switch_default_model "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+  esac
+
+  case "$target" in
+    best|quality|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+      rel="$(_local_ai_resolve_model_target "$target")" || return 1
+      _llama_switch_default_model "$rel"
       ;;
     current|"")
       echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
       ;;
     *)
-      echo "Usage: llama-use {best|balanced|fast|31b|26b|e4b|current}"
+      echo "Usage: llama-use {best|balanced|fast|31b|26b|e4b|qwen27|current}"
       return 1
       ;;
   esac
@@ -668,21 +723,9 @@ llama-use-31b() {
 }
 
 run-gemma4-26b() {
-  local mmproj
+  local model="${1:-gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf}"
 
-  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF")" || {
-    echo "No Gemma 4 26B mmproj file found under $LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF"
-    echo "Try: gemma4-26b-pull q4"
-    return 1
-  }
-
-  llama-start "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf" \
-    --mmproj "$mmproj" \
-    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
-    --temp 1.0 \
-    --top-p 0.95 \
-    --top-k 64 \
-    --chat-template-kwargs '{"enable_thinking":false}'
+  _llama_start_gemma4_model "$model" "gemma-4-26B-A4B-it-GGUF" "Gemma 4 26B"
 }
 
 llama-pull-gemma4-26b() {
@@ -715,6 +758,24 @@ llama-pull-gemma4-26b() {
   mkdir -p "$target"
   hf download unsloth/gemma-4-26B-A4B-it-GGUF \
     "$model_file" \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+}
+
+llama-pull-gemma4-26b-mmproj() {
+  local target="$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF"
+
+  mkdir -p "$target"
+  hf download unsloth/gemma-4-26B-A4B-it-GGUF \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+}
+
+llama-pull-gemma4-31b-mmproj() {
+  local target="$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF"
+
+  mkdir -p "$target"
+  hf download unsloth/gemma-4-31B-it-GGUF \
     mmproj-BF16.gguf \
     --local-dir "$target"
 }
@@ -803,44 +864,827 @@ llama-pull-qwen35-27b-q5() {
 }
 
 run-qwen35-27b() {
-  llama-start "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf" \
+  local model="${1:-Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf}"
+
+  _local_ai_ensure_model_assets "$model" || return 1
+
+  llama-start "$model" \
     --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 0.7 \
-    --top-p 0.8
-}
-
-run-gemma4-31b() {
-  local mmproj
-
-  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF")" || {
-    echo "No Gemma 4 31B mmproj file found under $LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF"
-    echo "Try: gemma4-31b-pull q4"
-    return 1
-  }
-
-  llama-start "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf" \
-    --mmproj "$mmproj" \
-    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
-    --temp 1.0 \
-    --top-p 0.95 \
-    --top-k 64 \
+    --top-p 0.8 \
+    --top-k 20 \
+    --presence-penalty 1.5 \
     --chat-template-kwargs '{"enable_thinking":false}'
 }
 
+run-gemma4-31b() {
+  local model="${1:-gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf}"
+
+  _llama_start_gemma4_model "$model" "gemma-4-31B-it-GGUF" "Gemma 4 31B"
+}
+
+_local_ai_ensure_runtime_dir() {
+  mkdir -p "$LOCAL_AI_RUNTIME_DIR"
+}
+
+_local_ai_validation_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/lmstudio-validation.tsv"
+}
+
+_local_ai_source_model() {
+  printf '%s\n' "${LOCAL_AI_SOURCE_MODEL:-$LLAMA_CPP_DEFAULT_MODEL}"
+}
+
+_local_ai_profile_name() {
+  local profile="${1:-$LLAMA_CPP_MACHINE_PROFILE}"
+
+  case "$profile" in
+    mac-mini-16g|mini|16g)
+      printf '%s\n' "mac-mini-16g"
+      ;;
+    balanced|mid)
+      printf '%s\n' "balanced"
+      ;;
+    macbook-pro-48g|macbook-pro|mbp|laptop|desktop-48g|desktop|48g|best)
+      printf '%s\n' "macbook-pro-48g"
+      ;;
+    *)
+      printf '%s\n' "$profile"
+      ;;
+  esac
+}
+
+_local_ai_profile_preset_override() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local preset="$2"
+  local profile_key="${profile//-/_}"
+  local preset_key="$preset"
+  local var_name="LOCAL_AI_PRESET_${profile_key}_${preset_key}_MODEL"
+
+  profile_key="${(U)profile_key}"
+  preset_key="${(U)preset_key}"
+  var_name="LOCAL_AI_PRESET_${profile_key}_${preset_key}_MODEL"
+
+  printf '%s\n' "${(P)var_name}"
+}
+
+_local_ai_profile_preset_model() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local preset="$2"
+  local override="$(_local_ai_profile_preset_override "$profile" "$preset")"
+
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+
+  case "$profile:$preset" in
+    mac-mini-16g:best)
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      ;;
+    mac-mini-16g:balanced|mac-mini-16g:fast)
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    *:best)
+      printf '%s\n' "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    *:balanced)
+      printf '%s\n' "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    *:fast)
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      ;;
+    *)
+      echo "Unknown preset mapping for profile '$profile': $preset"
+      return 1
+      ;;
+  esac
+}
+
+_local_ai_is_named_preset() {
+  case "$1" in
+    best|quality|31b|gemma4-31b|gemma-4-31b|balanced|daily|26b|gemma4-26b|gemma-4-26b|fast|small|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_local_ai_list_importable_models() {
+  mkdir -p "$LLAMA_CPP_MODELS"
+
+  find "$LLAMA_CPP_MODELS" -type f -iname '*.gguf' \
+    ! -iname 'mmproj*.gguf' \
+    ! -iname '*mmproj*' \
+    ! -iname '*proj*' \
+    | sort
+}
+
+_local_ai_model_has_mmproj() {
+  local rel="$1"
+  local model_dir="$LLAMA_CPP_MODELS/${rel%/*}"
+  local candidate
+
+  for candidate in "$model_dir"/mmproj*.gguf "$model_dir"/*mmproj*.gguf; do
+    if [ -f "$candidate" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+_local_ai_lmstudio_model_key() {
+  local rel="$1"
+  local repo="${rel%%/*}"
+
+  printf 'local/%s\n' "$repo"
+}
+
+_local_ai_get_validation_status() {
+  local rel="$1"
+  local file="$(_local_ai_validation_file)"
+
+  if [ ! -f "$file" ]; then
+    return 1
+  fi
+
+  awk -F '\t' -v rel="$rel" '$1 == rel { print $2 }' "$file" | tail -n 1
+}
+
+_local_ai_set_validation_status() {
+  local rel="$1"
+  local status="$2"
+  local note="$3"
+  local file="$(_local_ai_validation_file)"
+  local tmp
+
+  _local_ai_ensure_runtime_dir
+  note="${note//$'\t'/ }"
+  note="${note//$'\n'/ }"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/local-ai-validation.XXXXXX")" || return 1
+
+  if [ -f "$file" ]; then
+    awk -F '\t' -v rel="$rel" '$1 != rel { print $0 }' "$file" > "$tmp"
+  fi
+
+  printf '%s\t%s\t%s\n' "$rel" "$status" "$note" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+_local_ai_resolve_model_target() {
+  local target="${1:-current}"
+
+  case "$target" in
+    current|"")
+      _local_ai_source_model
+      ;;
+    best|quality)
+      _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "best"
+      ;;
+    balanced|daily)
+      _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "balanced"
+      ;;
+    fast|small)
+      _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "fast"
+      ;;
+    31b|gemma4-31b|gemma-4-31b)
+      printf '%s\n' "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    26b|gemma4-26b|gemma-4-26b)
+      printf '%s\n' "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    e4b|gemma4-e4b|gemma-4-e4b)
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      ;;
+    qwen|qwen27|qwen3.5-27b)
+      printf '%s\n' "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf"
+      ;;
+    *.gguf|*/*)
+      printf '%s\n' "$target"
+      ;;
+    *)
+      echo "Unknown model target: $target"
+      return 1
+      ;;
+  esac
+}
+
+_local_ai_ensure_model_assets() {
+  local rel="$1"
+
+  case "$rel" in
+    gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 31B Q4 model..."
+        llama-pull-gemma4-31b q4 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 31B mmproj..."
+        llama-pull-gemma4-31b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q5_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 31B Q5 model..."
+        llama-pull-gemma4-31b q5 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 31B mmproj..."
+        llama-pull-gemma4-31b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q6_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 31B Q6 model..."
+        llama-pull-gemma4-31b q6 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 31B mmproj..."
+        llama-pull-gemma4-31b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-31B-it-GGUF/gemma-4-31B-it-Q8_0.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 31B Q8 model..."
+        llama-pull-gemma4-31b q8 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 31B mmproj..."
+        llama-pull-gemma4-31b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 26B Q4 model..."
+        llama-pull-gemma4-26b q4 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 26B mmproj..."
+        llama-pull-gemma4-26b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 26B Q5 model..."
+        llama-pull-gemma4-26b q5 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 26B mmproj..."
+        llama-pull-gemma4-26b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 26B Q6 model..."
+        llama-pull-gemma4-26b q6 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 26B mmproj..."
+        llama-pull-gemma4-26b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q8_0.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 26B Q8 model..."
+        llama-pull-gemma4-26b q8 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 26B mmproj..."
+        llama-pull-gemma4-26b-mmproj || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q8 model..."
+        llama-pull-gemma4-e4b q8 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q8 || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q4 model..."
+        llama-pull-gemma4-e4b q4 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q4 || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q5_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q5 model..."
+        llama-pull-gemma4-e4b q5 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q5 || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q6_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q6 model..."
+        llama-pull-gemma4-e4b q6 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q6 || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q4_K_M model..."
+        llama-pull-gemma4-e4b q4km || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q4km || return 1
+      fi
+      ;;
+    gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q5_K_M.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Gemma 4 E4B Q5_K_M model..."
+        llama-pull-gemma4-e4b q5km || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1; then
+        echo "Pulling missing Gemma 4 E4B mmproj..."
+        llama-pull-gemma4-e4b q5km || return 1
+      fi
+      ;;
+    Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.5 27B model..."
+        llama-pull-qwen35-27b-q5 || return 1
+      fi
+      ;;
+    *)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Model not found: $LLAMA_CPP_MODELS/$rel"
+        return 1
+      fi
+      ;;
+  esac
+}
+
+_local_ai_llama_cpp_model_runnable() {
+  local rel="$1"
+
+  case "$rel" in
+    gemma-4-31B-it-GGUF/*)
+      [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
+      _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF" >/dev/null 2>&1
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*)
+      [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
+      _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF" >/dev/null 2>&1
+      ;;
+    gemma-4-E4B-it-GGUF/*)
+      [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
+      _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1
+      ;;
+    *)
+      [ -f "$LLAMA_CPP_MODELS/$rel" ]
+      ;;
+  esac
+}
+
+_local_ai_resolve_llama_cpp_target() {
+  local target="${1:-current}"
+  local requested=""
+  local primary=""
+  local candidates=""
+  local candidate=""
+
+  case "$target" in
+    current|"")
+      requested="$(_local_ai_source_model)"
+      if _local_ai_llama_cpp_model_runnable "$requested"; then
+        printf '%s\n' "$requested"
+        return 0
+      fi
+      echo "Current llama.cpp model is not runnable: $requested"
+      return 1
+      ;;
+    best|quality|balanced|daily|fast|small)
+      primary="$(_local_ai_resolve_model_target "$target")" || return 1
+
+      case "$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE"):$target" in
+        mac-mini-16g:best|mac-mini-16g:quality)
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          ;;
+        mac-mini-16g:balanced|mac-mini-16g:daily)
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          ;;
+        mac-mini-16g:fast|mac-mini-16g:small)
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf'
+          ;;
+        *:best|*:quality)
+          candidates=$'gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          ;;
+        *:balanced|*:daily)
+          candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
+          ;;
+        *)
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
+          ;;
+      esac
+
+      for candidate in ${(f)candidates}; do
+        if _local_ai_llama_cpp_model_runnable "$candidate"; then
+          if [ "$candidate" != "$primary" ]; then
+            echo "Requested $target, but $primary is not runnable locally. Using $candidate instead." >&2
+          fi
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done
+      ;;
+    qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
+      requested="$(_local_ai_resolve_model_target "$target")" || return 1
+      if _local_ai_llama_cpp_model_runnable "$requested"; then
+        printf '%s\n' "$requested"
+        return 0
+      fi
+      echo "Requested llama.cpp model is not runnable: $requested"
+      return 1
+      ;;
+    *)
+      echo "Unknown model target: $target"
+      return 1
+      ;;
+  esac
+
+  echo "No runnable llama.cpp model found for target: $target"
+  return 1
+}
+
+_local_ai_run_llama_cpp_source() {
+  local rel="$1"
+
+  case "$rel" in
+    gemma-4-31B-it-GGUF/*)
+      run-gemma4-31b "$rel"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*)
+      run-gemma4-26b "$rel"
+      ;;
+    gemma-4-E4B-it-GGUF/*)
+      run-gemma4-e4b "$rel"
+      ;;
+    Qwen3.5-27B-GGUF/*)
+      run-qwen35-27b "$rel"
+      ;;
+    *)
+      llama-start "$rel"
+      ;;
+  esac
+}
+
+_local_ai_sync_env() {
+  local source_model="$(_local_ai_source_model)"
+
+  export LOCAL_AI_CONTEXT_LENGTH="$LLAMA_CPP_GEMMA_CTX_SIZE"
+
+  case "$LOCAL_AI_PROVIDER" in
+    lmstudio)
+      export LOCAL_AI_PROVIDER="lmstudio"
+      export LOCAL_AI_PROVIDER_URL="$LOCAL_AI_LMSTUDIO_BASE_URL"
+      export LOCAL_AI_API_KEY="${LM_API_TOKEN:-local}"
+      export LOCAL_AI_MODEL="$(_local_ai_lmstudio_model_key "$source_model")"
+      ;;
+    *)
+      export LOCAL_AI_PROVIDER="llama.cpp"
+      export LOCAL_AI_PROVIDER_URL="$LOCAL_AI_LLAMA_CPP_BASE_URL"
+      export LOCAL_AI_API_KEY="local"
+      export LOCAL_AI_MODEL="$LLAMA_CPP_SERVER_ALIAS"
+      ;;
+  esac
+
+  export OPENAI_BASE_URL="$LOCAL_AI_PROVIDER_URL"
+  export OPENAI_API_KEY="$LOCAL_AI_API_KEY"
+}
+
+_local_ai_lmstudio_model_exists() {
+  local key="$1"
+
+  command -v lms >/dev/null 2>&1 || return 1
+  lms ls "$key" --json >/dev/null 2>&1
+}
+
+_local_ai_lmstudio_start_server() {
+  command -v lms >/dev/null 2>&1 || {
+    echo "LM Studio CLI not found"
+    return 1
+  }
+
+  lms server start --bind "$LOCAL_AI_LMSTUDIO_HOST" --port "$LOCAL_AI_LMSTUDIO_PORT" >/dev/null 2>&1 || true
+}
+
+_local_ai_lmstudio_validate_model() {
+  local rel="$1"
+  local key="$2"
+  local base="${rel##*/}"
+  local identifier=""
+
+  if ! _local_ai_model_has_mmproj "$rel"; then
+    _local_ai_set_validation_status "$rel" "text" "text-only import"
+    return 0
+  fi
+
+  base="${base%.gguf}"
+  identifier="local-ai-validate-${base}-$$"
+
+  _local_ai_lmstudio_start_server || return 1
+
+  if lms load "$key" --context-length "$LOCAL_AI_CONTEXT_LENGTH" --identifier "$identifier" -y >/dev/null 2>&1; then
+    lms unload "$identifier" >/dev/null 2>&1 || true
+    _local_ai_set_validation_status "$rel" "lmstudio-capable" "multimodal import validated"
+    echo "LM Studio multimodal validation passed for $rel"
+    return 0
+  fi
+
+  _local_ai_set_validation_status "$rel" "llama.cpp-preferred" "LM Studio load failed for multimodal import"
+  echo "LM Studio could not validate multimodal support for $rel; keep using llama.cpp for this model"
+  return 0
+}
+
+lmstudio-import-llama-model() {
+  local dry_run=0
+  local rel=""
+  local abs=""
+  local key=""
+  local cmd=()
+
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+  esac
+
+  rel="$1"
+
+  if [ -z "$rel" ]; then
+    echo "Usage: lmstudio-import-llama-model [--dry-run] <relative-gguf-path>"
+    return 1
+  fi
+
+  case "$rel" in
+    *mmproj*.gguf|mmproj*.gguf)
+      echo "Skipping sidecar file: $rel"
+      return 0
+      ;;
+  esac
+
+  abs="$(_llama_require_model "$rel")" || return 1
+  key="$(_local_ai_lmstudio_model_key "$rel")"
+  cmd=(lms import "$abs" --yes --user-repo "$key" --symbolic-link)
+
+  if [ "$dry_run" -eq 1 ]; then
+    cmd+=(--dry-run)
+  fi
+
+  "${cmd[@]}" || return 1
+
+  if [ "$dry_run" -eq 1 ]; then
+    return 0
+  fi
+
+  _local_ai_lmstudio_validate_model "$rel" "$key" || return 1
+  _local_ai_sync_env >/dev/null 2>&1 || true
+}
+
+lmstudio-import-llama-all() {
+  local dry_run=0
+  local rel=""
+  local total=0
+  local failures=0
+
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      ;;
+  esac
+
+  while IFS= read -r rel; do
+    total=$((total + 1))
+
+    if [ "$dry_run" -eq 1 ]; then
+      lmstudio-import-llama-model --dry-run "$rel" || failures=$((failures + 1))
+    else
+      lmstudio-import-llama-model "$rel" || failures=$((failures + 1))
+    fi
+  done < <(_local_ai_list_importable_models | sed "s#^$LLAMA_CPP_MODELS/##")
+
+  echo "LM Studio import summary: total=$total failures=$failures"
+
+  if [ "$failures" -gt 0 ]; then
+    return 1
+  fi
+}
+
+lmstudio-list-imported() {
+  local rel=""
+  local key=""
+  local imported=""
+  local validation=""
+
+  command -v lms >/dev/null 2>&1 || {
+    echo "LM Studio CLI not found"
+    return 1
+  }
+
+  while IFS= read -r rel; do
+    key="$(_local_ai_lmstudio_model_key "$rel")"
+    imported="no"
+    validation="text"
+
+    if _local_ai_lmstudio_model_exists "$key"; then
+      imported="yes"
+    fi
+
+    if _local_ai_model_has_mmproj "$rel"; then
+      validation="$(_local_ai_get_validation_status "$rel")"
+      if [ -z "$validation" ]; then
+        validation="unvalidated"
+      fi
+    fi
+
+    printf '%s | imported=%s | validation=%s | source=%s\n' "$key" "$imported" "$validation" "$rel"
+  done < <(_local_ai_list_importable_models | sed "s#^$LLAMA_CPP_MODELS/##")
+}
+
+local-ai-use() {
+  local provider="${1:-}"
+
+  case "$provider" in
+    lmstudio|lm)
+      export LOCAL_AI_PROVIDER="lmstudio"
+      ;;
+    llama.cpp|llama|llamacpp)
+      export LOCAL_AI_PROVIDER="llama.cpp"
+      ;;
+    current|"")
+      ;;
+    *)
+      echo "Usage: local-ai-use {lmstudio|llama.cpp|current}"
+      return 1
+      ;;
+  esac
+
+  _local_ai_sync_env
+  echo "LOCAL_AI_PROVIDER -> $LOCAL_AI_PROVIDER"
+  echo "LOCAL_AI_PROVIDER_URL -> $LOCAL_AI_PROVIDER_URL"
+  echo "LOCAL_AI_MODEL -> $LOCAL_AI_MODEL"
+}
+
+local-ai-env() {
+  _local_ai_sync_env
+
+  echo "export LOCAL_AI_PROVIDER=$LOCAL_AI_PROVIDER"
+  echo "export LOCAL_AI_PROVIDER_URL=$LOCAL_AI_PROVIDER_URL"
+  echo "export LOCAL_AI_API_KEY=$LOCAL_AI_API_KEY"
+  echo "export LOCAL_AI_MODEL=$LOCAL_AI_MODEL"
+  echo "export LOCAL_AI_CONTEXT_LENGTH=$LOCAL_AI_CONTEXT_LENGTH"
+  echo "export OPENAI_BASE_URL=$OPENAI_BASE_URL"
+  echo "export OPENAI_API_KEY=$OPENAI_API_KEY"
+}
+
+local-ai-status() {
+  local reachability="down"
+  local api_key_mode="local"
+  local imported="n/a"
+  local source_model="$(_local_ai_source_model)"
+
+  _local_ai_sync_env
+
+  if [ "$LOCAL_AI_API_KEY" != "local" ]; then
+    api_key_mode="token"
+  fi
+
+  case "$LOCAL_AI_PROVIDER" in
+    lmstudio)
+      if _local_ai_lmstudio_model_exists "$LOCAL_AI_MODEL"; then
+        imported="yes"
+      else
+        imported="no"
+      fi
+
+      if [ "$api_key_mode" = "token" ]; then
+        curl -fsS -H "Authorization: Bearer $LOCAL_AI_API_KEY" "$LOCAL_AI_PROVIDER_URL/models" >/dev/null 2>&1 && reachability="up"
+      else
+        curl -fsS "$LOCAL_AI_PROVIDER_URL/models" >/dev/null 2>&1 && reachability="up"
+      fi
+      ;;
+    *)
+      curl -fsS "$(_llama_endpoint)/health" >/dev/null 2>&1 && reachability="up"
+      ;;
+  esac
+
+  echo "LOCAL_AI_PROVIDER:       $LOCAL_AI_PROVIDER"
+  echo "LOCAL_AI_PROVIDER_URL:   $LOCAL_AI_PROVIDER_URL"
+  echo "LOCAL_AI_API_KEY_MODE:   $api_key_mode"
+  echo "LOCAL_AI_MODEL:          $LOCAL_AI_MODEL"
+  echo "LOCAL_AI_SOURCE_MODEL:   $source_model"
+  echo "LOCAL_AI_CONTEXT_LENGTH: $LOCAL_AI_CONTEXT_LENGTH"
+  echo "Local AI server:         $reachability"
+
+  if [ "$LOCAL_AI_PROVIDER" = "lmstudio" ]; then
+    echo "LM Studio imported:      $imported"
+  fi
+}
+
+local-ai-load() {
+  local target="${1:-current}"
+  local rel=""
+  local key=""
+  local validation=""
+
+  case "$LOCAL_AI_PROVIDER" in
+    lmstudio)
+      rel="$(_local_ai_resolve_model_target "$target")" || return 1
+      if _local_ai_is_named_preset "$target"; then
+        _local_ai_ensure_model_assets "$rel" || return 1
+      fi
+      _llama_switch_default_model "$rel" || return 1
+      key="$(_local_ai_lmstudio_model_key "$rel")"
+
+      if ! _local_ai_lmstudio_model_exists "$key"; then
+        echo "Importing $rel into LM Studio..."
+        lmstudio-import-llama-model "$rel" || return 1
+      fi
+
+      if _local_ai_model_has_mmproj "$rel"; then
+        validation="$(_local_ai_get_validation_status "$rel")"
+
+        if [ "$validation" != "lmstudio-capable" ]; then
+          _local_ai_lmstudio_validate_model "$rel" "$key" || return 1
+          validation="$(_local_ai_get_validation_status "$rel")"
+        fi
+
+        if [ "$validation" = "llama.cpp-preferred" ]; then
+          echo "LM Studio is not validated for multimodal use with $rel"
+          echo "Use: local-ai-use llama.cpp && local-ai-load $target"
+          return 1
+        fi
+      fi
+
+      _local_ai_lmstudio_start_server || return 1
+      lms load "$key" --context-length "$LOCAL_AI_CONTEXT_LENGTH" -y || return 1
+      _local_ai_sync_env
+      echo "LM Studio model loaded: $key"
+      ;;
+    *)
+      rel="$(_local_ai_resolve_model_target "$target")" || return 1
+      if _local_ai_is_named_preset "$target"; then
+        _local_ai_ensure_model_assets "$rel" || return 1
+      fi
+      rel="$(_local_ai_resolve_llama_cpp_target "$target")" || return 1
+      _llama_switch_default_model "$rel" || return 1
+      _local_ai_run_llama_cpp_source "$rel" || return 1
+      _local_ai_sync_env
+      ;;
+  esac
+}
+
 alias qwen27='run-qwen35-27b'
-alias gemma4-best='run-gemma4-31b'
-alias gemma4-balanced='run-gemma4-26b'
-alias gemma4-fast='run-gemma4-e4b'
+alias gemma4-best='llama-switch best'
+alias gemma4-balanced='llama-switch balanced'
+alias gemma4-fast='llama-switch fast'
 alias gemma4-mini='run-gemma4-e4b'
 alias gemma4-profile-mini='llama-profile mini'
 alias gemma4-profile-macbook-pro='llama-profile macbook-pro'
 alias gemma4-profile-desktop='llama-profile macbook-pro'
+alias gemma4-switch-best='llama-switch best'
+alias gemma4-switch-balanced='llama-switch balanced'
+alias gemma4-switch-fast='llama-switch fast'
 alias gemma4-best-pull='llama-pull-gemma4-31b'
 alias gemma4-balanced-pull='llama-pull-gemma4-26b'
 alias gemma4-fast-pull='llama-pull-gemma4-e4b'
 alias gemma4-mini-pull='llama-pull-gemma4-e4b q8'
 alias gemma4-31b-pull='llama-pull-gemma4-31b'
+alias gemma4-31b-mmproj-pull='llama-pull-gemma4-31b-mmproj'
 alias gemma4-26b-pull='llama-pull-gemma4-26b'
+alias gemma4-26b-mmproj-pull='llama-pull-gemma4-26b-mmproj'
 alias gemma4-e4b-pull='llama-pull-gemma4-e4b'
 alias qwen27-pull='llama-pull-qwen35-27b-q5'
 

@@ -38,6 +38,57 @@ Useful commands:
 
 The script makes backups before overwriting anything unless `--no-backup` is used.
 
+## Local AI backends
+
+This setup exposes a small local-provider layer on top of the existing `llama.cpp` helpers.
+
+Core env vars:
+
+- `LOCAL_AI_PROVIDER`: current backend, either `llama.cpp` or `lmstudio`
+- `LOCAL_AI_PROVIDER_URL`: OpenAI-compatible local base URL
+- `LOCAL_AI_API_KEY`: local auth token, usually `local` unless LM Studio auth is enabled
+- `LOCAL_AI_MODEL`: model identifier for the active backend
+- `LOCAL_AI_CONTEXT_LENGTH`: context length matched to the current machine profile
+
+It also derives:
+
+- `OPENAI_BASE_URL`
+- `OPENAI_API_KEY`
+
+Useful commands:
+
+```bash
+local-ai-use llama.cpp
+local-ai-use lmstudio
+local-ai-status
+local-ai-env
+local-ai-load current
+local-ai-load best
+```
+
+Named presets such as `best`, `balanced`, and `fast` are profile-aware and will auto-pull missing model assets for the chosen backend path before loading.
+
+Preset mappings can be overridden per machine profile with env vars such as:
+
+- `LOCAL_AI_PRESET_MAC_MINI_16G_BEST_MODEL`
+- `LOCAL_AI_PRESET_MAC_MINI_16G_BALANCED_MODEL`
+- `LOCAL_AI_PRESET_MAC_MINI_16G_FAST_MODEL`
+- `LOCAL_AI_PRESET_MACBOOK_PRO_48G_BEST_MODEL`
+
+Each value should be a relative model path under `LLAMA_CPP_MODELS`.
+
+LM Studio can reuse the GGUF files already stored under `LLAMA_CPP_MODELS`:
+
+```bash
+lmstudio-import-llama-model gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf
+lmstudio-import-llama-all
+lmstudio-list-imported
+```
+
+Imports use `lms import --symbolic-link`, so LM Studio points at the same files instead of copying them.
+
+For multimodal `GGUF + mmproj` models, the import helpers run an LM Studio validation pass. If LM Studio cannot load that imported layout successfully, the model is marked as `llama.cpp`-preferred and should stay on the direct `llama.cpp` path.
+
 ## Notes
 
 This setup is pretty personal, so a few paths assume my machine layout, including:

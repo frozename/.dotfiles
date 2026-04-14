@@ -3,8 +3,12 @@
 # =========================================================
 
 devstorage-status() {
+  echo "WORKSSD:          $WORKSSD"
   echo "DEV_STORAGE:      $DEV_STORAGE"
   echo "DEV_STORAGE_MODE: $DEV_STORAGE_MODE"
+  if [ -n "$DEV_STORAGE_REPAIR_BACKUP" ]; then
+    echo "DEV_STORAGE_BACKUP: $DEV_STORAGE_REPAIR_BACKUP"
+  fi
 }
 
 ollama-refresh-env() {
@@ -18,7 +22,9 @@ ollama-restart() {
   osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || true
   sleep 1
 
-  if [ -x "$HOME/bin/devstorage-switch" ]; then
+  if typeset -f devstorage_switch >/dev/null 2>&1; then
+    devstorage_switch >/dev/null 2>&1
+  elif [ -x "$HOME/bin/devstorage-switch" ]; then
     "$HOME/bin/devstorage-switch" >/dev/null 2>&1
   fi
 
@@ -544,6 +550,16 @@ devstorage-autoheal() {
 
 add-zsh-hook precmd devstorage-autoheal
 
-if [[ -o interactive && "$DEV_STORAGE_MODE" = "local" ]]; then
-  echo "⚠️ WorkSSD not mounted — using local fallback"
+if [[ -o interactive ]]; then
+  if [[ -n "$DEV_STORAGE_REPAIR_BACKUP" ]]; then
+    echo "ℹ️ Archived legacy DevStorage to $DEV_STORAGE_REPAIR_BACKUP and switched back to WorkSSD"
+  fi
+
+  if [[ "$DEV_STORAGE_MODE" = "local" ]]; then
+    if [[ -d "$WORKSSD" ]]; then
+      echo "⚠️ WorkSSD is mounted, but DevStorage is still using local storage"
+    else
+      echo "⚠️ WorkSSD not mounted — using local fallback"
+    fi
+  fi
 fi

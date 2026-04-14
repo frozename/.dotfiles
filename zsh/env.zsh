@@ -21,15 +21,70 @@ fi
 
 export WORKSSD="/Volumes/WorkSSD"
 export DEV_STORAGE="$HOME/DevStorage"
+export DEV_STORAGE_FALLBACK="$HOME/.devstorage"
+export DEV_STORAGE_REPAIR_BACKUP=""
 
-if [ -x "$HOME/bin/devstorage-switch" ]; then
-  "$HOME/bin/devstorage-switch" >/dev/null 2>&1
-fi
+devstorage_prepare_fallback() {
+  mkdir -p "$DEV_STORAGE_FALLBACK"/{cache,tmp,fnm,ai-models,repos,docker,bin}
+  mkdir -p "$DEV_STORAGE_FALLBACK"/cache/{brew,pip,uv,ccache,npm,turbo,nx,node-gyp}
+  mkdir -p "$DEV_STORAGE_FALLBACK"/ai-models/ollama
+  mkdir -p "$DEV_STORAGE_FALLBACK"/repos/{work,personal}
+}
 
-if [ -L "$DEV_STORAGE" ] && [ "$(readlink "$DEV_STORAGE")" = "$WORKSSD" ]; then
-  export DEV_STORAGE_MODE="external"
-else
-  export DEV_STORAGE_MODE="local"
+devstorage_target() {
+  if [ -d "$WORKSSD" ]; then
+    printf '%s\n' "$WORKSSD"
+  else
+    printf '%s\n' "$DEV_STORAGE_FALLBACK"
+  fi
+}
+
+devstorage_mode_for_target() {
+  if [ "$1" = "$WORKSSD" ]; then
+    printf 'external\n'
+  else
+    printf 'local\n'
+  fi
+}
+
+devstorage_relink() {
+  local target="$1"
+
+  rm -f "$DEV_STORAGE"
+  ln -s "$target" "$DEV_STORAGE"
+}
+
+devstorage_switch() {
+  local target current_target backup_path
+
+  devstorage_prepare_fallback
+  target="$(devstorage_target)"
+
+  if [ -L "$DEV_STORAGE" ]; then
+    current_target="$(readlink "$DEV_STORAGE" 2>/dev/null || true)"
+    if [ "$current_target" != "$target" ]; then
+      devstorage_relink "$target"
+    fi
+  elif [ -e "$DEV_STORAGE" ]; then
+    if [ "$target" = "$WORKSSD" ]; then
+      backup_path="$HOME/.devstorage-legacy-$(date +%Y%m%d-%H%M%S)"
+      mv "$DEV_STORAGE" "$backup_path"
+      export DEV_STORAGE_REPAIR_BACKUP="$backup_path"
+      devstorage_relink "$target"
+    fi
+  else
+    ln -s "$target" "$DEV_STORAGE"
+  fi
+
+  export DEV_STORAGE_MODE="$(devstorage_mode_for_target "$target")"
+}
+
+if ! devstorage_switch >/dev/null 2>&1; then
+  if [ -L "$DEV_STORAGE" ] && [ "$(readlink "$DEV_STORAGE" 2>/dev/null)" = "$WORKSSD" ]; then
+    export DEV_STORAGE_MODE="external"
+  else
+    export DEV_STORAGE_MODE="local"
+  fi
 fi
 
 if [ -n "$ZSH_VERSION" ]; then

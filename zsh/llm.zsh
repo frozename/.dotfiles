@@ -444,13 +444,113 @@ llama-clean() {
 }
 
 run-gemma4-e4b() {
-  llama-start "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf" \
-    --mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF/mmproj-BF16.gguf" \
-    --ctx-size 32768 \
+  local model_dir="$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF"
+  local model=""
+  local mmproj=""
+
+  for candidate in \
+    "gemma-4-E4B-it-Q8_0.gguf" \
+    "gemma-4-E4B-it-UD-Q5_K_XL.gguf" \
+    "gemma-4-E4B-it-UD-Q4_K_XL.gguf" \
+    "gemma-4-E4B-it-Q6_K.gguf" \
+    "gemma-4-E4B-it-Q5_K_M.gguf" \
+    "gemma-4-E4B-it-Q4_K_M.gguf"
+  do
+    if [ -f "$model_dir/$candidate" ]; then
+      model="gemma-4-E4B-it-GGUF/$candidate"
+      break
+    fi
+  done
+
+  if [ -z "$model" ]; then
+    echo "No Gemma 4 E4B model found under $model_dir"
+    echo "Try: gemma4-e4b-pull q8"
+    return 1
+  fi
+
+  for candidate in "mmproj-BF16.gguf" "mmproj-F16.gguf"; do
+    if [ -f "$model_dir/$candidate" ]; then
+      mmproj="$model_dir/$candidate"
+      break
+    fi
+  done
+
+  if [ -z "$mmproj" ]; then
+    echo "No Gemma 4 E4B mmproj file found under $model_dir"
+    echo "Try: gemma4-e4b-pull q8"
+    return 1
+  fi
+
+  llama-start "$model" \
+    --mmproj "$mmproj" \
+    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 1.0 \
     --top-p 0.95 \
     --top-k 64 \
     --chat-template-kwargs '{"enable_thinking":false}'
+}
+
+_llama_find_mmproj() {
+  local model_dir="$1"
+
+  for candidate in "mmproj-BF16.gguf" "mmproj-F16.gguf"; do
+    if [ -f "$model_dir/$candidate" ]; then
+      printf '%s/%s\n' "$model_dir" "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+_llama_recommended_model_for_profile() {
+  local profile="$1"
+  local model=""
+
+  case "$profile" in
+    mac-mini-16g|mini|16g)
+      for model in \
+        "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf" \
+        "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf" \
+        "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      do
+        if [ -f "$LLAMA_CPP_MODELS/$model" ]; then
+          printf '%s\n' "$model"
+          return 0
+        fi
+      done
+
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      ;;
+    balanced|mid)
+      for model in \
+        "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf" \
+        "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf" \
+        "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      do
+        if [ -f "$LLAMA_CPP_MODELS/$model" ]; then
+          printf '%s\n' "$model"
+          return 0
+        fi
+      done
+
+      printf '%s\n' "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    *)
+      for model in \
+        "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf" \
+        "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf" \
+        "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      do
+        if [ -f "$LLAMA_CPP_MODELS/$model" ]; then
+          printf '%s\n' "$model"
+          return 0
+        fi
+      done
+
+      printf '%s\n' "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+  esac
 }
 
 _llama_switch_default_model() {
@@ -473,22 +573,90 @@ _llama_switch_default_model() {
   echo "LLAMA_CPP_DEFAULT_MODEL -> $LLAMA_CPP_DEFAULT_MODEL"
 }
 
+llama-profile() {
+  local profile="${1:-current}"
+  local model=""
+
+  case "$profile" in
+    current)
+      echo "LLAMA_CPP_MACHINE_PROFILE=$LLAMA_CPP_MACHINE_PROFILE"
+      echo "LLAMA_CPP_GEMMA_CTX_SIZE=$LLAMA_CPP_GEMMA_CTX_SIZE"
+      echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
+      return 0
+      ;;
+    mac-mini-16g|mini|16g)
+      export LLAMA_CPP_MACHINE_PROFILE="mac-mini-16g"
+      export LLAMA_CPP_GEMMA_CTX_SIZE="16384"
+      ;;
+    balanced|mid)
+      export LLAMA_CPP_MACHINE_PROFILE="balanced"
+      export LLAMA_CPP_GEMMA_CTX_SIZE="24576"
+      ;;
+    macbook-pro-48g|macbook-pro|mbp|laptop|desktop-48g|desktop|48g|best)
+      export LLAMA_CPP_MACHINE_PROFILE="macbook-pro-48g"
+      export LLAMA_CPP_GEMMA_CTX_SIZE="32768"
+      ;;
+    *)
+      echo "Usage: llama-profile {mini|balanced|macbook-pro|current}"
+      return 1
+      ;;
+  esac
+
+  model="$(_llama_recommended_model_for_profile "$LLAMA_CPP_MACHINE_PROFILE")"
+  export LLAMA_CPP_DEFAULT_MODEL="$model"
+
+  echo "LLAMA_CPP_MACHINE_PROFILE=$LLAMA_CPP_MACHINE_PROFILE"
+  echo "LLAMA_CPP_GEMMA_CTX_SIZE=$LLAMA_CPP_GEMMA_CTX_SIZE"
+  echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
+}
+
+llama-profile-mini() {
+  llama-profile mini
+}
+
+llama-profile-macbook-pro() {
+  llama-profile macbook-pro
+}
+
+llama-profile-desktop() {
+  llama-profile macbook-pro
+}
+
 llama-use() {
   case "$1" in
-    26b|gemma4-26b|gemma-4-26b)
+    best|quality|31b|gemma4-31b|gemma-4-31b)
+      _llama_switch_default_model "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    balanced|daily|26b|gemma4-26b|gemma-4-26b)
       _llama_switch_default_model "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
       ;;
-    31b|gemma4-31b|gemma-4-31b)
-      _llama_switch_default_model "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+    fast|small|e4b|gemma4-e4b|gemma-4-e4b)
+      _llama_switch_default_model "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
       ;;
     current|"")
       echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
       ;;
     *)
-      echo "Usage: llama-use {26b|31b|current}"
+      echo "Usage: llama-use {best|balanced|fast|31b|26b|e4b|current}"
       return 1
       ;;
   esac
+}
+
+llama-use-best() {
+  llama-use best
+}
+
+llama-use-balanced() {
+  llama-use balanced
+}
+
+llama-use-fast() {
+  llama-use fast
+}
+
+llama-use-e4b() {
+  llama-use e4b
 }
 
 llama-use-26b() {
@@ -500,13 +668,129 @@ llama-use-31b() {
 }
 
 run-gemma4-26b() {
+  local mmproj
+
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF")" || {
+    echo "No Gemma 4 26B mmproj file found under $LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF"
+    echo "Try: gemma4-26b-pull q4"
+    return 1
+  }
+
   llama-start "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf" \
-    --mmproj "$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF/mmproj-BF16.gguf" \
-    --ctx-size 32768 \
+    --mmproj "$mmproj" \
+    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 1.0 \
     --top-p 0.95 \
     --top-k 64 \
     --chat-template-kwargs '{"enable_thinking":false}'
+}
+
+llama-pull-gemma4-26b() {
+  local target="$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF"
+  local quant="${1:-q4}"
+  local model_file=""
+
+  case "$quant" in
+    q4|4bit|recommended|default|balanced)
+      model_file="gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    q5)
+      model_file="gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf"
+      ;;
+    q6)
+      model_file="gemma-4-26B-A4B-it-UD-Q6_K_XL.gguf"
+      ;;
+    q8|8bit)
+      model_file="gemma-4-26B-A4B-it-Q8_0.gguf"
+      ;;
+    *.gguf)
+      model_file="$quant"
+      ;;
+    *)
+      echo "Usage: llama-pull-gemma4-26b [q4|q5|q6|q8|<filename.gguf>]"
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$target"
+  hf download unsloth/gemma-4-26B-A4B-it-GGUF \
+    "$model_file" \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+}
+
+llama-pull-gemma4-e4b() {
+  local target="$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF"
+  local quant="${1:-q8}"
+  local model_file=""
+
+  case "$quant" in
+    q8|8bit|recommended|default)
+      model_file="gemma-4-E4B-it-Q8_0.gguf"
+      ;;
+    q4|4bit|balanced)
+      model_file="gemma-4-E4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    q5)
+      model_file="gemma-4-E4B-it-UD-Q5_K_XL.gguf"
+      ;;
+    q6)
+      model_file="gemma-4-E4B-it-UD-Q6_K_XL.gguf"
+      ;;
+    q4km)
+      model_file="gemma-4-E4B-it-Q4_K_M.gguf"
+      ;;
+    q5km)
+      model_file="gemma-4-E4B-it-Q5_K_M.gguf"
+      ;;
+    *.gguf)
+      model_file="$quant"
+      ;;
+    *)
+      echo "Usage: llama-pull-gemma4-e4b [q8|q4|q5|q6|q4km|q5km|<filename.gguf>]"
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$target"
+  hf download unsloth/gemma-4-E4B-it-GGUF \
+    "$model_file" \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+}
+
+llama-pull-gemma4-31b() {
+  local target="$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF"
+  local quant="${1:-q4}"
+  local model_file=""
+
+  case "$quant" in
+    q4|4bit|recommended|default|best)
+      model_file="gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    q5)
+      model_file="gemma-4-31B-it-UD-Q5_K_XL.gguf"
+      ;;
+    q6)
+      model_file="gemma-4-31B-it-UD-Q6_K_XL.gguf"
+      ;;
+    q8|8bit)
+      model_file="gemma-4-31B-it-Q8_0.gguf"
+      ;;
+    *.gguf)
+      model_file="$quant"
+      ;;
+    *)
+      echo "Usage: llama-pull-gemma4-31b [q4|q5|q6|q8|<filename.gguf>]"
+      return 1
+      ;;
+  esac
+
+  mkdir -p "$target"
+  hf download unsloth/gemma-4-31B-it-GGUF \
+    "$model_file" \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
 }
 
 llama-pull-qwen35-27b-q5() {
@@ -520,15 +804,23 @@ llama-pull-qwen35-27b-q5() {
 
 run-qwen35-27b() {
   llama-start "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf" \
-    --ctx-size 32768 \
+    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 0.7 \
     --top-p 0.8
 }
 
 run-gemma4-31b() {
+  local mmproj
+
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF")" || {
+    echo "No Gemma 4 31B mmproj file found under $LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF"
+    echo "Try: gemma4-31b-pull q4"
+    return 1
+  }
+
   llama-start "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf" \
-    --mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF/mmproj-BF16.gguf" \
-    --ctx-size 32768 \
+    --mmproj "$mmproj" \
+    --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
     --temp 1.0 \
     --top-p 0.95 \
     --top-k 64 \
@@ -536,6 +828,20 @@ run-gemma4-31b() {
 }
 
 alias qwen27='run-qwen35-27b'
+alias gemma4-best='run-gemma4-31b'
+alias gemma4-balanced='run-gemma4-26b'
+alias gemma4-fast='run-gemma4-e4b'
+alias gemma4-mini='run-gemma4-e4b'
+alias gemma4-profile-mini='llama-profile mini'
+alias gemma4-profile-macbook-pro='llama-profile macbook-pro'
+alias gemma4-profile-desktop='llama-profile macbook-pro'
+alias gemma4-best-pull='llama-pull-gemma4-31b'
+alias gemma4-balanced-pull='llama-pull-gemma4-26b'
+alias gemma4-fast-pull='llama-pull-gemma4-e4b'
+alias gemma4-mini-pull='llama-pull-gemma4-e4b q8'
+alias gemma4-31b-pull='llama-pull-gemma4-31b'
+alias gemma4-26b-pull='llama-pull-gemma4-26b'
+alias gemma4-e4b-pull='llama-pull-gemma4-e4b'
 alias qwen27-pull='llama-pull-qwen35-27b-q5'
 
 alias claude-mem='bun "$HOME/.claude/plugins/marketplaces/thedotmack/plugin/scripts/worker-service.cjs"'

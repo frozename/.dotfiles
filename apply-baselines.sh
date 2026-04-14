@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 
-set -euo pipefail
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=$(
+  CDPATH= cd "$(dirname "$0")" && pwd
+)
 
 usage() {
   cat <<'EOF'
@@ -30,18 +32,16 @@ EOF
 }
 
 is_ignored_candidate() {
-  local candidate="$1"
-  local basename_candidate
+  ignored_candidate=$1
+  ignored_basename=$(basename "$ignored_candidate")
 
-  basename_candidate="$(basename "$candidate")"
-
-  case "$candidate" in
+  case "$ignored_candidate" in
     apply-baselines.sh|AGENTS.md|README|README.*|LICENSE|LICENSE.*|.gitignore|.gitattributes)
       return 0
       ;;
   esac
 
-  case "$basename_candidate" in
+  case "$ignored_basename" in
     .DS_Store)
       return 0
       ;;
@@ -51,53 +51,53 @@ is_ignored_candidate() {
 }
 
 collect_baselines() {
-  local path
-  local relative_path
-
-  while IFS= read -r path; do
-    relative_path="${path#"$SCRIPT_DIR"/}"
-    if is_ignored_candidate "$relative_path"; then
+  find "$SCRIPT_DIR" -type f ! -path "$SCRIPT_DIR/.git/*" | LC_ALL=C sort | while IFS= read -r collect_path; do
+    collect_relative_path=${collect_path#"$SCRIPT_DIR"/}
+    if is_ignored_candidate "$collect_relative_path"; then
       continue
     fi
-    printf '%s\n' "$relative_path"
-  done < <(find "$SCRIPT_DIR" -type f ! -path "$SCRIPT_DIR/.git/*" | LC_ALL=C sort)
+    printf '%s\n' "$collect_relative_path"
+  done
 }
 
 toggle_first_path_segment() {
-  local candidate="$1"
-  local first_segment
-  local remainder=""
+  toggle_candidate=$1
+  toggle_first_segment=${toggle_candidate%%/*}
+  toggle_remainder=
 
-  first_segment="${candidate%%/*}"
-  if [[ "$candidate" == */* ]]; then
-    remainder="${candidate#*/}"
-  fi
+  case "$toggle_candidate" in
+    */*)
+      toggle_remainder=${toggle_candidate#*/}
+      ;;
+  esac
 
-  if [[ "$first_segment" == .* ]]; then
-    first_segment="${first_segment#.}"
+  case "$toggle_first_segment" in
+    .*)
+      toggle_first_segment=${toggle_first_segment#.}
+      ;;
+    *)
+      toggle_first_segment=.$toggle_first_segment
+      ;;
+  esac
+
+  if [ -n "$toggle_remainder" ] && [ "$toggle_remainder" != "$toggle_candidate" ]; then
+    printf '%s/%s\n' "$toggle_first_segment" "$toggle_remainder"
   else
-    first_segment=".$first_segment"
-  fi
-
-  if [[ -n "$remainder" ]] && [[ "$remainder" != "$candidate" ]]; then
-    printf '%s/%s\n' "$first_segment" "$remainder"
-  else
-    printf '%s\n' "$first_segment"
+    printf '%s\n' "$toggle_first_segment"
   fi
 }
 
 resolve_baseline_name() {
-  local candidate="$1"
-  local alternate
+  resolve_candidate=$1
 
-  if [[ -f "$SCRIPT_DIR/$candidate" ]] && ! is_ignored_candidate "$candidate"; then
-    printf '%s\n' "$candidate"
+  if [ -f "$SCRIPT_DIR/$resolve_candidate" ] && ! is_ignored_candidate "$resolve_candidate"; then
+    printf '%s\n' "$resolve_candidate"
     return 0
   fi
 
-  alternate="$(toggle_first_path_segment "$candidate")"
-  if [[ -f "$SCRIPT_DIR/$alternate" ]] && ! is_ignored_candidate "$alternate"; then
-    printf '%s\n' "$alternate"
+  resolve_alternate=$(toggle_first_path_segment "$resolve_candidate")
+  if [ -f "$SCRIPT_DIR/$resolve_alternate" ] && ! is_ignored_candidate "$resolve_alternate"; then
+    printf '%s\n' "$resolve_alternate"
     return 0
   fi
 
@@ -105,23 +105,28 @@ resolve_baseline_name() {
 }
 
 destination_for() {
-  local baseline="$1"
-  local first_segment
-  local remainder=""
+  destination_baseline=$1
+  destination_first_segment=${destination_baseline%%/*}
+  destination_remainder=
 
-  first_segment="${baseline%%/*}"
-  if [[ "$baseline" == */* ]]; then
-    remainder="${baseline#*/}"
-  fi
+  case "$destination_baseline" in
+    */*)
+      destination_remainder=${destination_baseline#*/}
+      ;;
+  esac
 
-  if [[ "$first_segment" != .* ]]; then
-    first_segment=".$first_segment"
-  fi
+  case "$destination_first_segment" in
+    .*)
+      ;;
+    *)
+      destination_first_segment=.$destination_first_segment
+      ;;
+  esac
 
-  if [[ -n "$remainder" ]] && [[ "$remainder" != "$baseline" ]]; then
-    printf '%s/%s/%s\n' "$HOME" "$first_segment" "$remainder"
+  if [ -n "$destination_remainder" ] && [ "$destination_remainder" != "$destination_baseline" ]; then
+    printf '%s/%s/%s\n' "$HOME" "$destination_first_segment" "$destination_remainder"
   else
-    printf '%s/%s\n' "$HOME" "$first_segment"
+    printf '%s/%s\n' "$HOME" "$destination_first_segment"
   fi
 }
 
@@ -130,102 +135,99 @@ source_for() {
 }
 
 print_known_baselines() {
-  local baseline
-  local destination
-
-  while IFS= read -r baseline; do
-    destination="$(destination_for "$baseline")"
-    printf '%s -> %s\n' "$baseline" "$destination"
-  done < <(collect_baselines)
+  collect_baselines | while IFS= read -r print_baseline; do
+    print_destination=$(destination_for "$print_baseline")
+    printf '%s -> %s\n' "$print_baseline" "$print_destination"
+  done
 }
 
 ensure_parent_dir() {
-  local destination="$1"
-  mkdir -p "$(dirname "$destination")"
+  mkdir -p "$(dirname "$1")"
 }
 
 backup_path_for() {
-  local destination="$1"
-  local backup_root="$2"
-  local relative_path
+  backup_destination=$1
+  backup_root=$2
+  backup_relative_path=${backup_destination#"$HOME"/}
+  backup_relative_path=${backup_relative_path#/}
 
-  relative_path="${destination#"$HOME"/}"
-  relative_path="${relative_path#/}"
-
-  if [[ -z "$relative_path" ]] || [[ "$relative_path" == "$destination" ]]; then
-    relative_path="$(basename "$destination")"
+  if [ -z "$backup_relative_path" ] || [ "$backup_relative_path" = "$backup_destination" ]; then
+    backup_relative_path=$(basename "$backup_destination")
   fi
 
-  printf '%s/%s\n' "$backup_root" "$relative_path"
+  printf '%s/%s\n' "$backup_root" "$backup_relative_path"
 }
 
 copy_file() {
-  local source="$1"
-  local destination="$2"
-  cp "$source" "$destination"
+  cp "$1" "$2"
 }
 
 apply_one() {
-  local baseline="$1"
-  local source="$2"
-  local destination="$3"
-  local dry_run="$4"
-  local no_backup="$5"
-  local backup_root="$6"
-  local backup_path=""
+  apply_baseline=$1
+  apply_source=$2
+  apply_destination=$3
+  apply_dry_run=$4
+  apply_no_backup=$5
+  apply_backup_root=$6
 
-  if [[ ! -f "$source" ]]; then
-    printf 'Missing baseline source: %s\n' "$source" >&2
+  if [ ! -f "$apply_source" ]; then
+    printf 'Missing baseline source: %s\n' "$apply_source" >&2
     return 1
   fi
 
-  if [[ -d "$destination" ]]; then
-    printf 'Refusing to overwrite directory: %s\n' "$destination" >&2
+  if [ -d "$apply_destination" ]; then
+    printf 'Refusing to overwrite directory: %s\n' "$apply_destination" >&2
     return 1
   fi
 
-  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
-    printf 'Unchanged %s (%s)\n' "$baseline" "$destination"
+  if [ -f "$apply_destination" ] && cmp -s "$apply_source" "$apply_destination"; then
+    printf 'Unchanged %s (%s)\n' "$apply_baseline" "$apply_destination"
     return 0
   fi
 
-  if [[ "$dry_run" -eq 1 ]]; then
-    if [[ -e "$destination" ]] && [[ "$no_backup" -ne 1 ]]; then
-      backup_path="$(backup_path_for "$destination" "$backup_root")"
-      printf 'Would back up %s -> %s\n' "$destination" "$backup_path"
+  if [ "$apply_dry_run" -eq 1 ]; then
+    if [ -e "$apply_destination" ] && [ "$apply_no_backup" -ne 1 ]; then
+      apply_backup_path=$(backup_path_for "$apply_destination" "$apply_backup_root")
+      printf 'Would back up %s -> %s\n' "$apply_destination" "$apply_backup_path"
     fi
-    printf 'Would apply %s -> %s\n' "$source" "$destination"
+    printf 'Would apply %s -> %s\n' "$apply_source" "$apply_destination"
     return 0
   fi
 
-  ensure_parent_dir "$destination"
+  ensure_parent_dir "$apply_destination"
 
-  if [[ -e "$destination" ]] && [[ "$no_backup" -ne 1 ]]; then
-    mkdir -p "$backup_root"
-    backup_path="$(backup_path_for "$destination" "$backup_root")"
-    mkdir -p "$(dirname "$backup_path")"
-    cp -a "$destination" "$backup_path"
-    printf 'Backed up %s -> %s\n' "$destination" "$backup_path"
+  if [ -e "$apply_destination" ] && [ "$apply_no_backup" -ne 1 ]; then
+    mkdir -p "$apply_backup_root"
+    apply_backup_path=$(backup_path_for "$apply_destination" "$apply_backup_root")
+    mkdir -p "$(dirname "$apply_backup_path")"
+    cp -p "$apply_destination" "$apply_backup_path"
+    printf 'Backed up %s -> %s\n' "$apply_destination" "$apply_backup_path"
   fi
 
-  copy_file "$source" "$destination"
-  printf 'Applied %s -> %s\n' "$baseline" "$destination"
+  copy_file "$apply_source" "$apply_destination"
+  printf 'Applied %s -> %s\n' "$apply_baseline" "$apply_destination"
+}
+
+cleanup_temp_files() {
+  if [ -n "${REQUESTED_FILE:-}" ] && [ -f "$REQUESTED_FILE" ]; then
+    rm -f "$REQUESTED_FILE"
+  fi
+
+  if [ -n "${RESOLVED_FILE:-}" ] && [ -f "$RESOLVED_FILE" ]; then
+    rm -f "$RESOLVED_FILE"
+  fi
 }
 
 main() {
-  local dry_run=0
-  local no_backup=0
-  local arg
-  local baseline
-  local resolved_baseline
-  local source
-  local destination
-  local backup_root
-  local -a requested=()
+  dry_run=0
+  no_backup=0
 
-  while [[ $# -gt 0 ]]; do
-    arg="$1"
-    case "$arg" in
+  REQUESTED_FILE=$(mktemp "${TMPDIR:-/tmp}/apply-baselines.requested.XXXXXX")
+  RESOLVED_FILE=$(mktemp "${TMPDIR:-/tmp}/apply-baselines.resolved.XXXXXX")
+  trap cleanup_temp_files EXIT INT TERM HUP
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
       -n|--dry-run)
         dry_run=1
         ;;
@@ -241,40 +243,38 @@ main() {
         return 0
         ;;
       *)
-        requested+=("$arg")
+        printf '%s\n' "$1" >> "$REQUESTED_FILE"
         ;;
     esac
     shift
   done
 
-  if [[ "${#requested[@]}" -eq 0 ]]; then
-    while IFS= read -r baseline; do
-      requested+=("$baseline")
-    done < <(collect_baselines)
+  if [ ! -s "$REQUESTED_FILE" ]; then
+    collect_baselines > "$REQUESTED_FILE"
   fi
 
-  if [[ "${#requested[@]}" -eq 0 ]]; then
+  if [ ! -s "$REQUESTED_FILE" ]; then
     printf 'No baselines found in %s\n' "$SCRIPT_DIR" >&2
     return 1
   fi
 
-  for arg in "${requested[@]}"; do
-    if ! resolved_baseline="$(resolve_baseline_name "$arg")"; then
-      printf 'Unknown baseline: %s\n' "$arg" >&2
+  while IFS= read -r main_arg; do
+    if ! main_resolved_baseline=$(resolve_baseline_name "$main_arg"); then
+      printf 'Unknown baseline: %s\n' "$main_arg" >&2
       printf 'Known baselines:\n' >&2
       print_known_baselines >&2
       return 1
     fi
-  done
+    printf '%s\n' "$main_resolved_baseline" >> "$RESOLVED_FILE"
+  done < "$REQUESTED_FILE"
 
-  backup_root="$HOME/.dotfiles-backups/$(date +%Y%m%d-%H%M%S)"
+  main_backup_root=$HOME/.dotfiles-backups/$(date +%Y%m%d-%H%M%S)
 
-  for arg in "${requested[@]}"; do
-    resolved_baseline="$(resolve_baseline_name "$arg")"
-    source="$(source_for "$resolved_baseline")"
-    destination="$(destination_for "$resolved_baseline")"
-    apply_one "$resolved_baseline" "$source" "$destination" "$dry_run" "$no_backup" "$backup_root"
-  done
+  while IFS= read -r main_resolved_baseline; do
+    main_source=$(source_for "$main_resolved_baseline")
+    main_destination=$(destination_for "$main_resolved_baseline")
+    apply_one "$main_resolved_baseline" "$main_source" "$main_destination" "$dry_run" "$no_backup" "$main_backup_root"
+  done < "$RESOLVED_FILE"
 }
 
 main "$@"

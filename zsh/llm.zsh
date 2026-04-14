@@ -90,12 +90,23 @@ _llama_require_model() {
 
   model_path="$(_llama_model_path "$model")"
 
-  if [ ! -e "$model_path" ]; then
-    echo "Model not found: $model_path"
+  if [ ! -f "$model_path" ]; then
+    echo "Model file not found: $model_path"
     return 1
   fi
 
   printf '%s\n' "$model_path"
+}
+
+_llama_list_runnable_models() {
+  mkdir -p "$LLAMA_CPP_MODELS"
+
+  find "$LLAMA_CPP_MODELS" -type f -iname '*.gguf' \
+    ! -iname 'mmproj*.gguf' \
+    ! -iname '*mmproj*' \
+    ! -iname '*vision*' \
+    ! -iname '*proj*' \
+    | sort
 }
 
 _llama_print_content() {
@@ -136,8 +147,7 @@ llama-models-dir() {
 }
 
 llama-models() {
-  mkdir -p "$LLAMA_CPP_MODELS"
-  find "$LLAMA_CPP_MODELS" -type f \( -iname '*.gguf' -o -iname '*.gguf-split*' \) | sort
+  _llama_list_runnable_models
 }
 
 llama-build() {
@@ -221,6 +231,7 @@ llama-start() {
   local pid
   local http_code=""
   local attempt=0
+  local timeout_seconds=60
   if [ $# -gt 0 ]; then
     shift
   fi
@@ -244,13 +255,7 @@ llama-start() {
     "$@" > "$LLAMA_CPP_LOGS/server.log" 2>&1 &
   pid=$!
 
-  while [ "$attempt" -lt 60 ]; do
-    if ! kill -0 "$pid" >/dev/null 2>&1; then
-      echo "llama.cpp exited early"
-      tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
-      return 1
-    fi
-
+  while [ "$attempt" -lt "$timeout_seconds" ]; do
     http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
 
     case "$http_code" in
@@ -260,13 +265,26 @@ llama-start() {
         ;;
       503)
         ;;
+      *)
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+          echo "llama.cpp exited before becoming ready"
+          tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+          return 1
+        fi
+        ;;
     esac
 
     attempt=$((attempt + 1))
     sleep 1
   done
 
-  echo "llama.cpp readiness check timed out"
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    echo "llama.cpp exited before becoming ready"
+    tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+    return 1
+  fi
+
+  echo "llama.cpp readiness check timed out after ${timeout_seconds}s"
   tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
   return 1
 }
@@ -366,12 +384,7 @@ llama-pull-file() {
 }
 
 llama-list() {
-  mkdir -p "$LLAMA_CPP_MODELS"
-  find "$LLAMA_CPP_MODELS" -type f \( -iname '*.gguf' -o -iname '*.gguf-split*' \) \
-    ! -iname 'mmproj*.gguf' \
-    ! -iname '*mmproj*' \
-    ! -iname '*vision*' \
-    ! -iname '*proj*' | sort
+  _llama_list_runnable_models
 }
 
 llama-run() {
@@ -379,6 +392,7 @@ llama-run() {
 }
 
 llama-pick() {
+  local models
   local selected
 
   if ! command -v fzf >/dev/null 2>&1; then
@@ -386,7 +400,13 @@ llama-pick() {
     return 1
   fi
 
-  selected="$(llama-list | sed "s#^$LLAMA_CPP_MODELS/##" | fzf --height 50% --layout=reverse --border --prompt='llama model > ')" || return 1
+  models="$(llama-list)"
+  if [ -z "$models" ]; then
+    echo "No runnable GGUF models found under $LLAMA_CPP_MODELS"
+    return 1
+  fi
+
+  selected="$(printf '%s\n' "$models" | sed "s#^$LLAMA_CPP_MODELS/##" | fzf --height 50% --layout=reverse --border --prompt='llama model > ')" || return 1
   [ -n "$selected" ] || return 1
   llama-start "$selected"
 }
@@ -483,6 +503,22 @@ run-gemma4-26b() {
     --chat-template-kwargs '{"enable_thinking":false}'
 }
 
+llama-pull-qwen35-27b-q5() {
+  local target="$LLAMA_CPP_MODELS/Qwen3.5-27B-GGUF"
+
+  mkdir -p "$target"
+  hf download unsloth/Qwen3.5-27B-GGUF \
+    Qwen3.5-27B-UD-Q5_K_XL.gguf \
+    --local-dir "$target"
+}
+
+run-qwen35-27b() {
+  llama-start "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf" \
+    --ctx-size 32768 \
+    --temp 0.7 \
+    --top-p 0.8
+}
+
 run-gemma4-31b() {
   llama-start "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf" \
     --mmproj "$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF/mmproj-BF16.gguf" \
@@ -492,6 +528,9 @@ run-gemma4-31b() {
     --top-k 64 \
     --chat-template-kwargs '{"enable_thinking":false}'
 }
+
+alias qwen27='run-qwen35-27b'
+alias qwen27-pull='llama-pull-qwen35-27b-q5'
 
 alias claude-mem='bun "$HOME/.claude/plugins/marketplaces/thedotmack/plugin/scripts/worker-service.cjs"'
 

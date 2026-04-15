@@ -462,7 +462,7 @@ _llama_start_gemma4_model() {
     --temp 1.0 \
     --top-p 0.95 \
     --top-k 64 \
-    --chat-template-kwargs '{"enable_thinking":false}'
+    --chat-template-kwargs "$(_local_ai_chat_template_kwargs)"
 }
 
 _llama_default_e4b_model() {
@@ -644,7 +644,7 @@ llama-switch() {
     current)
       _local_ai_run_llama_cpp_source "$(_local_ai_source_model)"
       ;;
-    best|quality|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
+    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
       rel="$(_local_ai_resolve_model_target "$target")" || return 1
       if _local_ai_is_named_preset "$target"; then
         _local_ai_ensure_model_assets "$rel" || return 1
@@ -653,7 +653,7 @@ llama-switch() {
       _local_ai_run_llama_cpp_source "$rel"
       ;;
     *)
-      echo "Usage: llama-switch {best|balanced|fast|31b|26b|e4b|qwen27|current|<relative-model-path>}"
+      echo "Usage: llama-switch {best|vision|balanced|fast|31b|26b|e4b|qwen27|current|<relative-model-path>}"
       return 1
       ;;
   esac
@@ -671,6 +671,10 @@ llama-switch-fast() {
   llama-switch fast
 }
 
+llama-switch-vision() {
+  llama-switch vision
+}
+
 llama-use() {
   local target="$1"
   local apply_now="$2"
@@ -684,7 +688,7 @@ llama-use() {
   esac
 
   case "$target" in
-    best|quality|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
       rel="$(_local_ai_resolve_model_target "$target")" || return 1
       _llama_switch_default_model "$rel"
       ;;
@@ -692,7 +696,7 @@ llama-use() {
       echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
       ;;
     *)
-      echo "Usage: llama-use {best|balanced|fast|31b|26b|e4b|qwen27|current}"
+      echo "Usage: llama-use {best|vision|balanced|fast|31b|26b|e4b|qwen27|current}"
       return 1
       ;;
   esac
@@ -865,16 +869,23 @@ llama-pull-qwen35-27b-q5() {
 
 run-qwen35-27b() {
   local model="${1:-Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf}"
+  local temp="0.7"
+  local top_p="0.8"
 
   _local_ai_ensure_model_assets "$model" || return 1
 
+  if _local_ai_thinking_enabled; then
+    temp="1.0"
+    top_p="0.95"
+  fi
+
   llama-start "$model" \
     --ctx-size "$LLAMA_CPP_GEMMA_CTX_SIZE" \
-    --temp 0.7 \
-    --top-p 0.8 \
+    --temp "$temp" \
+    --top-p "$top_p" \
     --top-k 20 \
     --presence-penalty 1.5 \
-    --chat-template-kwargs '{"enable_thinking":false}'
+    --chat-template-kwargs "$(_local_ai_chat_template_kwargs)"
 }
 
 run-gemma4-31b() {
@@ -893,6 +904,47 @@ _local_ai_validation_file() {
 
 _local_ai_source_model() {
   printf '%s\n' "${LOCAL_AI_SOURCE_MODEL:-$LLAMA_CPP_DEFAULT_MODEL}"
+}
+
+_local_ai_thinking_enabled() {
+  case "${LOCAL_AI_ENABLE_THINKING:-false}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_local_ai_chat_template_kwargs() {
+  if _local_ai_thinking_enabled; then
+    printf '%s\n' '{"enable_thinking":true}'
+  else
+    printf '%s\n' '{"enable_thinking":false}'
+  fi
+}
+
+llama-thinking() {
+  local mode="${1:-current}"
+
+  case "$mode" in
+    on|enable|enabled|true|thinking)
+      export LOCAL_AI_ENABLE_THINKING="true"
+      ;;
+    off|disable|disabled|false|instruct|non-thinking|nonthinking)
+      export LOCAL_AI_ENABLE_THINKING="false"
+      ;;
+    current|"")
+      ;;
+    *)
+      echo "Usage: llama-thinking {on|off|current}"
+      return 1
+      ;;
+  esac
+
+  echo "LOCAL_AI_ENABLE_THINKING=$LOCAL_AI_ENABLE_THINKING"
+  echo "LLAMA_CHAT_TEMPLATE_KWARGS=$(_local_ai_chat_template_kwargs)"
 }
 
 _local_ai_profile_name() {
@@ -942,6 +994,9 @@ _local_ai_profile_preset_model() {
     mac-mini-16g:best)
       printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
       ;;
+    mac-mini-16g:vision)
+      printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+      ;;
     mac-mini-16g:balanced|mac-mini-16g:fast)
       printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf"
       ;;
@@ -949,6 +1004,9 @@ _local_ai_profile_preset_model() {
       printf '%s\n' "gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
       ;;
     *:balanced)
+      printf '%s\n' "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    *:vision)
       printf '%s\n' "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
       ;;
     *:fast)
@@ -963,7 +1021,7 @@ _local_ai_profile_preset_model() {
 
 _local_ai_is_named_preset() {
   case "$1" in
-    best|quality|31b|gemma4-31b|gemma-4-31b|balanced|daily|26b|gemma4-26b|gemma-4-26b|fast|small|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+    best|quality|vision|image|31b|gemma4-31b|gemma-4-31b|balanced|daily|26b|gemma4-26b|gemma-4-26b|fast|small|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
       return 0
       ;;
     *)
@@ -1043,6 +1101,9 @@ _local_ai_resolve_model_target() {
       ;;
     best|quality)
       _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "best"
+      ;;
+    vision|image)
+      _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "vision"
       ;;
     balanced|daily)
       _local_ai_profile_preset_model "$LLAMA_CPP_MACHINE_PROFILE" "balanced"
@@ -1284,12 +1345,15 @@ _local_ai_resolve_llama_cpp_target() {
       echo "Current llama.cpp model is not runnable: $requested"
       return 1
       ;;
-    best|quality|balanced|daily|fast|small)
+    best|quality|vision|image|balanced|daily|fast|small)
       primary="$(_local_ai_resolve_model_target "$target")" || return 1
 
       case "$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE"):$target" in
         mac-mini-16g:best|mac-mini-16g:quality)
           candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          ;;
+        mac-mini-16g:vision|mac-mini-16g:image)
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
           ;;
         mac-mini-16g:balanced|mac-mini-16g:daily)
           candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
@@ -1299,6 +1363,9 @@ _local_ai_resolve_llama_cpp_target() {
           ;;
         *:best|*:quality)
           candidates=$'gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          ;;
+        *:vision|*:image)
+          candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
           ;;
         *:balanced|*:daily)
           candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
@@ -1668,6 +1735,7 @@ local-ai-load() {
 
 alias qwen27='run-qwen35-27b'
 alias gemma4-best='llama-switch best'
+alias gemma4-vision='llama-switch vision'
 alias gemma4-balanced='llama-switch balanced'
 alias gemma4-fast='llama-switch fast'
 alias gemma4-mini='run-gemma4-e4b'
@@ -1675,6 +1743,7 @@ alias gemma4-profile-mini='llama-profile mini'
 alias gemma4-profile-macbook-pro='llama-profile macbook-pro'
 alias gemma4-profile-desktop='llama-profile macbook-pro'
 alias gemma4-switch-best='llama-switch best'
+alias gemma4-switch-vision='llama-switch vision'
 alias gemma4-switch-balanced='llama-switch balanced'
 alias gemma4-switch-fast='llama-switch fast'
 alias gemma4-best-pull='llama-pull-gemma4-31b'
@@ -1687,6 +1756,8 @@ alias gemma4-26b-pull='llama-pull-gemma4-26b'
 alias gemma4-26b-mmproj-pull='llama-pull-gemma4-26b-mmproj'
 alias gemma4-e4b-pull='llama-pull-gemma4-e4b'
 alias qwen27-pull='llama-pull-qwen35-27b-q5'
+alias llama-thinking-on='llama-thinking on'
+alias llama-thinking-off='llama-thinking off'
 
 alias claude-mem='bun "$HOME/.claude/plugins/marketplaces/thedotmack/plugin/scripts/worker-service.cjs"'
 

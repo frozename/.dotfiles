@@ -49,6 +49,7 @@ Core env vars:
 - `LOCAL_AI_API_KEY`: local auth token, usually `local` unless LM Studio auth is enabled
 - `LOCAL_AI_MODEL`: model identifier for the active backend
 - `LOCAL_AI_CONTEXT_LENGTH`: context length matched to the current machine profile
+- `LOCAL_AI_ENABLE_THINKING`: shared chat-template thinking toggle for Qwen/Gemma hybrid reasoning models
 
 It also derives:
 
@@ -64,16 +65,20 @@ local-ai-status
 local-ai-env
 local-ai-load current
 local-ai-load best
+llama-thinking on
+llama-thinking off
 ```
 
-Named presets such as `best`, `balanced`, and `fast` are profile-aware and will auto-pull missing model assets for the chosen backend path before loading.
+Named presets such as `best`, `vision`, `balanced`, and `fast` are profile-aware and will auto-pull missing model assets for the chosen backend path before loading.
 
 Preset mappings can be overridden per machine profile with env vars such as:
 
 - `LOCAL_AI_PRESET_MAC_MINI_16G_BEST_MODEL`
+- `LOCAL_AI_PRESET_MAC_MINI_16G_VISION_MODEL`
 - `LOCAL_AI_PRESET_MAC_MINI_16G_BALANCED_MODEL`
 - `LOCAL_AI_PRESET_MAC_MINI_16G_FAST_MODEL`
 - `LOCAL_AI_PRESET_MACBOOK_PRO_48G_BEST_MODEL`
+- `LOCAL_AI_PRESET_MACBOOK_PRO_48G_VISION_MODEL`
 
 Each value should be a relative model path under `LLAMA_CPP_MODELS`.
 

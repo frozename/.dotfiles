@@ -50,6 +50,8 @@ Core env vars:
 - `LOCAL_AI_MODEL`: model identifier for the active backend
 - `LOCAL_AI_CONTEXT_LENGTH`: context length matched to the current machine profile
 - `LOCAL_AI_ENABLE_THINKING`: shared chat-template thinking toggle for Qwen/Gemma hybrid reasoning models
+- `LLAMA_CPP_USE_TUNED_ARGS`: whether to apply cached benchmark-selected launch args automatically
+- `LLAMA_CPP_AUTO_TUNE_ON_PULL`: whether newly downloaded model quants should be benchmarked automatically after a successful pull
 
 It also derives:
 
@@ -67,9 +69,29 @@ local-ai-load current
 local-ai-load best
 llama-thinking on
 llama-thinking off
+llama-bench-preset vision
+llama-bench-show vision
+llama-bench-history vision
+llama-keep-alive vision
+llama-keep-alive-status
+llama-keep-alive-stop
+llama-recommend-quant fast
+llama-pull-recommended best
 ```
 
 Named presets such as `best`, `vision`, `balanced`, and `fast` are profile-aware and will auto-pull missing model assets for the chosen backend path before loading.
+
+`llama-bench-preset <target>` benchmarks a few local launch profiles for the resolved model, saves the best one under `LOCAL_AI_RUNTIME_DIR`, and `llama-start` will reuse that cached profile automatically unless `LLAMA_CPP_USE_TUNED_ARGS=false`.
+
+When `LLAMA_CPP_AUTO_TUNE_ON_PULL=true`, a newly downloaded quant will also run through `llama-bench-preset` automatically once so it gets a cached launch profile immediately.
+
+`llama-bench-history [target]` shows the recent benchmark winners that have been recorded for a model, including the launch args that were selected.
+
+Vision models also get a safer automatic retry path on startup if the first `llama-server` launch fails to become ready.
+
+For projector files, the Gemma helpers now score any sibling `mmproj*.gguf` files using GGUF metadata when available and prefer the best match instead of assuming a single hard-coded filename.
+
+`llama-keep-alive <target>` runs a lightweight supervisor loop for `llama.cpp` that restarts the selected model with backoff if the server drops during long local sessions. The loop state and logs are written under `LOCAL_AI_RUNTIME_DIR` and `LLAMA_CPP_LOGS`.
 
 Preset mappings can be overridden per machine profile with env vars such as:
 
@@ -81,6 +103,8 @@ Preset mappings can be overridden per machine profile with env vars such as:
 - `LOCAL_AI_PRESET_MACBOOK_PRO_48G_VISION_MODEL`
 
 Each value should be a relative model path under `LLAMA_CPP_MODELS`.
+
+Quant recommendations are also profile-aware. `llama-recommend-quant <target>` prints the suggested quant for the active machine profile, and `llama-pull-recommended <target>` downloads the corresponding model directly.
 
 LM Studio can reuse the GGUF files already stored under `LLAMA_CPP_MODELS`:
 

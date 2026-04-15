@@ -175,6 +175,369 @@ llama-update() {
   llama-build
 }
 
+_llama_backup_root() {
+  printf '%s\n' "$LLAMA_CPP_ROOT/.backups"
+}
+
+_llama_backup_binaries() {
+  local backup_root="$(_llama_backup_root)"
+  local timestamp
+  local backup_dir
+  local copied=0
+  local bin
+
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$backup_root/$timestamp"
+
+  mkdir -p "$backup_dir" || return 1
+
+  for bin in llama-server llama-cli llama-bench; do
+    if [ -x "$LLAMA_CPP_BIN/$bin" ]; then
+      cp -p "$LLAMA_CPP_BIN/$bin" "$backup_dir/$bin" || return 1
+      copied=1
+    fi
+  done
+
+  if [ "$copied" -eq 0 ]; then
+    rmdir "$backup_dir" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  printf '%s\n' "$backup_dir"
+}
+
+_llama_restore_binaries() {
+  local backup_dir="$1"
+  local bin_path
+
+  if [ -z "$backup_dir" ] || [ ! -d "$backup_dir" ]; then
+    return 0
+  fi
+
+  mkdir -p "$LLAMA_CPP_BIN" || return 1
+
+  for bin_path in "$backup_dir"/*; do
+    if [ -f "$bin_path" ]; then
+      cp -p "$bin_path" "$LLAMA_CPP_BIN/${bin_path:t}" || return 1
+    fi
+  done
+}
+
+_llama_smoke_test_binaries() {
+  local server_bin="$LLAMA_CPP_BIN/llama-server"
+
+  if [ ! -x "$server_bin" ]; then
+    echo "llama-server binary not found: $server_bin"
+    return 1
+  fi
+
+  "$server_bin" --help >/dev/null 2>&1 || {
+    echo "llama-server smoke test failed"
+    return 1
+  }
+}
+
+_llama_bench_profile_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-bench-profiles.tsv"
+}
+
+_llama_bench_history_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-bench-history.tsv"
+}
+
+_llama_bench_profile_get() {
+  local rel="$1"
+  local file="$(_llama_bench_profile_file)"
+
+  if [ ! -f "$file" ]; then
+    return 1
+  fi
+
+  awk -F '\t' -v rel="$rel" '$1 == rel { print $2 }' "$file" | tail -n 1
+}
+
+_llama_bench_history_append() {
+  local rel="$1"
+  local profile="$2"
+  local gen_ts="$3"
+  local prompt_ts="$4"
+  local file="$(_llama_bench_history_file)"
+
+  _local_ai_ensure_runtime_dir
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+    "$rel" \
+    "$profile" \
+    "$gen_ts" \
+    "$prompt_ts" \
+    "$(_llama_server_profile_args "$profile")" >> "$file"
+}
+
+_llama_bench_profile_set() {
+  local rel="$1"
+  local profile="$2"
+  local gen_ts="$3"
+  local prompt_ts="$4"
+  local file="$(_llama_bench_profile_file)"
+  local tmp
+
+  _local_ai_ensure_runtime_dir
+  tmp="$(mktemp "${TMPDIR:-/tmp}/llama-bench-profiles.XXXXXX")" || return 1
+
+  if [ -f "$file" ]; then
+    awk -F '\t' -v rel="$rel" '$1 != rel { print $0 }' "$file" > "$tmp"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$profile" "$gen_ts" "$prompt_ts" "$(date +%Y-%m-%dT%H:%M:%S%z)" >> "$tmp"
+  mv "$tmp" "$file"
+  _llama_bench_history_append "$rel" "$profile" "$gen_ts" "$prompt_ts"
+}
+
+_llama_server_profile_args() {
+  case "$1" in
+    throughput)
+      printf '%s\n' "-fa on -b 4096 -ub 1024"
+      ;;
+    conservative)
+      printf '%s\n' "-fa off -b 1024 -ub 256"
+      ;;
+    default|*)
+      printf '%s\n' "-fa on -b 2048 -ub 512"
+      ;;
+  esac
+}
+
+_llama_bench_profile_args() {
+  case "$1" in
+    throughput)
+      printf '%s\n' "-fa 1 -b 4096 -ub 1024"
+      ;;
+    conservative)
+      printf '%s\n' "-fa 0 -b 1024 -ub 256"
+      ;;
+    default|*)
+      printf '%s\n' "-fa 1 -b 2048 -ub 512"
+      ;;
+  esac
+}
+
+_llama_tuned_profile_enabled() {
+  case "${LLAMA_CPP_USE_TUNED_ARGS:-true}" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+_llama_start_has_mmproj() {
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --mmproj|-mm|--mmproj-url|--mmproj-auto)
+        return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+_llama_safe_retry_args() {
+  printf '%s\n' "--flash-attn off --no-cache-prompt --parallel 1 --no-cont-batching --no-mmproj-offload --no-warmup"
+}
+
+_llama_launch_server_background() {
+  local model_path="$1"
+  shift
+
+  nohup llama-server \
+    -m "$model_path" \
+    --alias "$LLAMA_CPP_SERVER_ALIAS" \
+    --host "$LLAMA_CPP_HOST" \
+    --port "$LLAMA_CPP_PORT" \
+    -ngl 999 \
+    "$@" > "$LLAMA_CPP_LOGS/server.log" 2>&1 &
+
+  printf '%s\n' "$!"
+}
+
+_llama_wait_for_ready() {
+  local pid="$1"
+  local health_endpoint="$2"
+  local timeout_seconds="${3:-60}"
+  local attempt=0
+  local http_code=""
+
+  while [ "$attempt" -lt "$timeout_seconds" ]; do
+    http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
+
+    case "$http_code" in
+      200)
+        return 0
+        ;;
+      503)
+        ;;
+      *)
+        if ! kill -0 "$pid" >/dev/null 2>&1; then
+          return 1
+        fi
+        ;;
+    esac
+
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 1
+}
+
+llama-bench-preset() {
+  local target="${1:-current}"
+  local rel=""
+  local model_path=""
+  local profile=""
+  local output=""
+  local gen_ts=""
+  local prompt_ts=""
+  local best_profile=""
+  local best_gen_ts="-1"
+  local best_prompt_ts="-1"
+  local bench_args_str=""
+
+  command -v jq >/dev/null 2>&1 || {
+    echo "jq is required for llama-bench-preset"
+    return 1
+  }
+
+  if [ ! -x "$LLAMA_CPP_BIN/llama-bench" ]; then
+    echo "llama-bench binary not found: $LLAMA_CPP_BIN/llama-bench"
+    return 1
+  fi
+
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  if _local_ai_is_named_preset "$target"; then
+    _local_ai_ensure_model_assets "$rel" || return 1
+  fi
+
+  model_path="$(_llama_require_model "$rel")" || return 1
+
+  for profile in default throughput conservative; do
+    bench_args_str="$(_llama_bench_profile_args "$profile")"
+    echo "Benchmarking $rel with profile '$profile'..."
+    output="$("$LLAMA_CPP_BIN/llama-bench" -m "$model_path" -pg 256,64 -r 1 -ngl 999 ${(z)bench_args_str} -o jsonl 2>/dev/null)" || {
+      echo "Benchmark failed for profile '$profile'"
+      continue
+    }
+
+    gen_ts="$(printf '%s\n' "$output" | jq -sr 'map(select(.n_gen > 0)) | first.avg_ts // -1')"
+    prompt_ts="$(printf '%s\n' "$output" | jq -sr 'map(select(.n_prompt > 0 and .n_gen == 0)) | first.avg_ts // -1')"
+
+    if [ "$(printf '%.0f\n' "$gen_ts")" -gt "$(printf '%.0f\n' "$best_gen_ts")" ] || {
+      [ "$(printf '%.0f\n' "$gen_ts")" -eq "$(printf '%.0f\n' "$best_gen_ts")" ] &&
+      [ "$(printf '%.0f\n' "$prompt_ts")" -gt "$(printf '%.0f\n' "$best_prompt_ts")" ]
+    }; then
+      best_profile="$profile"
+      best_gen_ts="$gen_ts"
+      best_prompt_ts="$prompt_ts"
+    fi
+  done
+
+  if [ -z "$best_profile" ]; then
+    echo "No successful benchmark profiles for $rel"
+    return 1
+  fi
+
+  _llama_bench_profile_set "$rel" "$best_profile" "$best_gen_ts" "$best_prompt_ts" || return 1
+  echo "Saved tuned launch profile for $rel"
+  echo "profile=$best_profile gen_tps=$best_gen_ts prompt_tps=$best_prompt_ts"
+}
+
+llama-bench-show() {
+  local target="${1:-current}"
+  local rel=""
+  local profile=""
+  local file="$(_llama_bench_profile_file)"
+
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  profile="$(_llama_bench_profile_get "$rel")"
+
+  if [ -z "$profile" ]; then
+    echo "No tuned launch profile recorded for $rel"
+    return 1
+  fi
+
+  awk -F '\t' -v rel="$rel" '$1 == rel { printf "model=%s\nprofile=%s\ngen_tps=%s\nprompt_tps=%s\nupdated_at=%s\n", $1, $2, $3, $4, $5 }' "$file" | tail -n 5
+  echo "launch_args=$(_llama_server_profile_args "$profile")"
+}
+
+llama-bench-history() {
+  local target="${1:-all}"
+  local file="$(_llama_bench_history_file)"
+
+  if [ ! -f "$file" ]; then
+    echo "No benchmark history recorded yet"
+    return 1
+  fi
+
+  if [ "$target" = "all" ]; then
+    awk -F '\t' '{ printf "%s | %s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }' "$file" | tail -n 20
+    return 0
+  fi
+
+  local rel=""
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  awk -F '\t' -v rel="$rel" '$2 == rel { printf "%s | %s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }' "$file" | tail -n 20
+}
+
+llama-update-safe() {
+  local backup_dir=""
+  local previous_commit=""
+  local current_commit=""
+
+  cd "$LLAMA_CPP_SRC" || return 1
+
+  previous_commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  backup_dir="$(_llama_backup_binaries)" || return 1
+
+  if git pull --rebase && llama-build && _llama_smoke_test_binaries; then
+    current_commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    echo "llama.cpp update succeeded: ${previous_commit:-unknown} -> ${current_commit:-unknown}"
+    if [ -n "$backup_dir" ]; then
+      echo "Binary backup saved at: $backup_dir"
+    fi
+    return 0
+  fi
+
+  echo "llama.cpp update failed; restoring previous binaries..."
+
+  if [ -n "$backup_dir" ]; then
+    _llama_restore_binaries "$backup_dir" || {
+      echo "Failed to restore binaries from $backup_dir"
+      return 1
+    }
+  fi
+
+  if _llama_smoke_test_binaries; then
+    echo "Previous llama.cpp binaries restored successfully."
+  else
+    echo "Restored llama.cpp binaries did not pass smoke test."
+    return 1
+  fi
+
+  current_commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  echo "Working source commit is now: ${current_commit:-unknown}"
+  echo "Previous known-good binary build came from: ${previous_commit:-unknown}"
+  return 1
+}
+
 llama-cli-local() {
   local model="$1"
   local model_path
@@ -235,9 +598,12 @@ llama-start() {
   local health_endpoint="$(_llama_endpoint)/health"
   local model_path
   local pid
-  local http_code=""
-  local attempt=0
   local timeout_seconds=60
+  local tuned_profile=""
+  local tuned_args_str=""
+  local safe_retry_args_str=""
+  local launch_args=()
+  local retry_args=()
   if [ $# -gt 0 ]; then
     shift
   fi
@@ -251,48 +617,279 @@ llama-start() {
 
   llama-stop >/dev/null 2>&1 || true
 
-  nohup llama-server \
-    -m "$model_path" \
-    --alias "$LLAMA_CPP_SERVER_ALIAS" \
-    --host "$LLAMA_CPP_HOST" \
-    --port "$LLAMA_CPP_PORT" \
-    -ngl 999 \
-    -fa on \
-    "$@" > "$LLAMA_CPP_LOGS/server.log" 2>&1 &
-  pid=$!
+  if _llama_tuned_profile_enabled; then
+    tuned_profile="$(_llama_bench_profile_get "$model")"
+    if [ -n "$tuned_profile" ]; then
+      tuned_args_str="$(_llama_server_profile_args "$tuned_profile")"
+      launch_args+=(${(z)tuned_args_str})
+      echo "Using tuned launch profile '$tuned_profile' for $model"
+    else
+      launch_args+=(${(z)$(_llama_server_profile_args default)})
+    fi
+  else
+    launch_args+=(${(z)$(_llama_server_profile_args default)})
+  fi
 
-  while [ "$attempt" -lt "$timeout_seconds" ]; do
-    http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
+  launch_args+=("$@")
+  pid="$(_llama_launch_server_background "$model_path" "${launch_args[@]}")"
 
-    case "$http_code" in
-      200)
-        llama-status
-        return 0
-        ;;
-      503)
-        ;;
-      *)
-        if ! kill -0 "$pid" >/dev/null 2>&1; then
-          echo "llama.cpp exited before becoming ready"
-          tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
-          return 1
-        fi
-        ;;
-    esac
+  if _llama_wait_for_ready "$pid" "$health_endpoint" "$timeout_seconds"; then
+    llama-status
+    return 0
+  fi
 
-    attempt=$((attempt + 1))
-    sleep 1
-  done
+  if _llama_start_has_mmproj "${launch_args[@]}"; then
+    echo "Vision model failed to become ready; retrying with safer server flags..."
+    safe_retry_args_str="$(_llama_safe_retry_args)"
+    retry_args=("${launch_args[@]}" ${(z)safe_retry_args_str})
+
+    llama-stop >/dev/null 2>&1 || true
+    pid="$(_llama_launch_server_background "$model_path" "${retry_args[@]}")"
+
+    if _llama_wait_for_ready "$pid" "$health_endpoint" "$timeout_seconds"; then
+      echo "llama.cpp recovered with safe vision flags"
+      llama-status
+      return 0
+    fi
+  fi
 
   if ! kill -0 "$pid" >/dev/null 2>&1; then
     echo "llama.cpp exited before becoming ready"
-    tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+  else
+    echo "llama.cpp readiness check timed out after ${timeout_seconds}s"
+  fi
+  tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
+  return 1
+}
+
+_llama_keep_alive_pid_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-keep-alive.pid"
+}
+
+_llama_keep_alive_stop_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-keep-alive.stop"
+}
+
+_llama_keep_alive_state_file() {
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-keep-alive.state"
+}
+
+_llama_keep_alive_log_file() {
+  printf '%s\n' "$LLAMA_CPP_LOGS/keep-alive.log"
+}
+
+_llama_keep_alive_write_state() {
+  local target="$1"
+  local rel="$2"
+  local state="$3"
+  local restarts="$4"
+  local backoff="$5"
+  local file="$(_llama_keep_alive_state_file)"
+
+  _local_ai_ensure_runtime_dir
+  mkdir -p "$LLAMA_CPP_LOGS"
+
+  printf 'updated_at=%s\ntarget=%s\nmodel=%s\nstate=%s\nrestarts=%s\nbackoff_seconds=%s\nlog=%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+    "$target" \
+    "$rel" \
+    "$state" \
+    "$restarts" \
+    "$backoff" \
+    "$(_llama_keep_alive_log_file)" > "$file"
+}
+
+_llama_keep_alive_running_pid() {
+  local pid_file="$(_llama_keep_alive_pid_file)"
+  local pid=""
+
+  [ -f "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$pid"
+}
+
+_llama_keep_alive_monitor_ready() {
+  local interval="${1:-$LLAMA_CPP_KEEP_ALIVE_INTERVAL}"
+  local health_endpoint="$(_llama_endpoint)/health"
+  local stop_file="$(_llama_keep_alive_stop_file)"
+  local http_code=""
+
+  while :; do
+    if [ -f "$stop_file" ]; then
+      return 1
+    fi
+
+    http_code="$(curl -fsS -o /dev/null -w "%{http_code}" "$health_endpoint" 2>/dev/null || true)"
+    case "$http_code" in
+      200|503)
+        sleep "$interval"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+}
+
+_llama_keep_alive_worker() {
+  local target="${1:-current}"
+  local interval="${LLAMA_CPP_KEEP_ALIVE_INTERVAL:-5}"
+  local max_backoff="${LLAMA_CPP_KEEP_ALIVE_MAX_BACKOFF:-30}"
+  local stop_file="$(_llama_keep_alive_stop_file)"
+  local pid_file="$(_llama_keep_alive_pid_file)"
+  local restarts=0
+  local backoff=1
+  local requested=""
+  local rel=""
+
+  trap 'llama-stop >/dev/null 2>&1 || true; rm -f "$pid_file" "$stop_file"; _llama_keep_alive_write_state "$target" "${rel:-unknown}" "stopped" "$restarts" "$backoff"; exit 0' INT TERM EXIT
+
+  while :; do
+    [ -f "$stop_file" ] && break
+
+    requested="$(_local_ai_resolve_model_target "$target")" || {
+      _llama_keep_alive_write_state "$target" "unresolved" "resolve-failed" "$restarts" "$backoff"
+      sleep "$backoff"
+      if [ "$backoff" -lt "$max_backoff" ]; then
+        backoff=$((backoff * 2))
+        [ "$backoff" -gt "$max_backoff" ] && backoff="$max_backoff"
+      fi
+      continue
+    }
+
+    if _local_ai_is_named_preset "$target"; then
+      _local_ai_ensure_model_assets "$requested" || {
+        _llama_keep_alive_write_state "$target" "$requested" "asset-fetch-failed" "$restarts" "$backoff"
+        sleep "$backoff"
+        if [ "$backoff" -lt "$max_backoff" ]; then
+          backoff=$((backoff * 2))
+          [ "$backoff" -gt "$max_backoff" ] && backoff="$max_backoff"
+        fi
+        continue
+      }
+    fi
+
+    rel="$(_local_ai_resolve_llama_cpp_target "$target")" || {
+      _llama_keep_alive_write_state "$target" "$requested" "not-runnable" "$restarts" "$backoff"
+      sleep "$backoff"
+      if [ "$backoff" -lt "$max_backoff" ]; then
+        backoff=$((backoff * 2))
+        [ "$backoff" -gt "$max_backoff" ] && backoff="$max_backoff"
+      fi
+      continue
+    }
+
+    _llama_keep_alive_write_state "$target" "$rel" "starting" "$restarts" "$backoff"
+    _llama_switch_default_model "$rel" >/dev/null 2>&1 || true
+
+    if _local_ai_run_llama_cpp_source "$rel"; then
+      backoff=1
+      _llama_keep_alive_write_state "$target" "$rel" "ready" "$restarts" "$backoff"
+
+      if _llama_keep_alive_monitor_ready "$interval"; then
+        continue
+      fi
+
+      [ -f "$stop_file" ] && break
+      restarts=$((restarts + 1))
+      _llama_keep_alive_write_state "$target" "$rel" "restart-pending" "$restarts" "$backoff"
+      sleep "$backoff"
+      if [ "$backoff" -lt "$max_backoff" ]; then
+        backoff=$((backoff * 2))
+        [ "$backoff" -gt "$max_backoff" ] && backoff="$max_backoff"
+      fi
+      continue
+    fi
+
+    restarts=$((restarts + 1))
+    _llama_keep_alive_write_state "$target" "$rel" "start-failed" "$restarts" "$backoff"
+    sleep "$backoff"
+    if [ "$backoff" -lt "$max_backoff" ]; then
+      backoff=$((backoff * 2))
+      [ "$backoff" -gt "$max_backoff" ] && backoff="$max_backoff"
+    fi
+  done
+
+  return 0
+}
+
+llama-keep-alive() {
+  local target="${1:-current}"
+  local pid=""
+  local log_file="$(_llama_keep_alive_log_file)"
+
+  _local_ai_ensure_runtime_dir
+  mkdir -p "$LLAMA_CPP_LOGS"
+
+  pid="$(_llama_keep_alive_running_pid 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    echo "llama.cpp keep-alive is already running: pid=$pid"
     return 1
   fi
 
-  echo "llama.cpp readiness check timed out after ${timeout_seconds}s"
-  tail -n 50 "$LLAMA_CPP_LOGS/server.log" 2>/dev/null
-  return 1
+  rm -f "$(_llama_keep_alive_stop_file)"
+  _llama_keep_alive_write_state "$target" "pending" "launching" 0 1
+  ( _llama_keep_alive_worker "$target" ) >> "$log_file" 2>&1 &!
+  pid="$!"
+
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid" > "$(_llama_keep_alive_pid_file)"
+  fi
+
+  echo "llama.cpp keep-alive started"
+  echo "target=$target"
+  echo "pid=${pid:-unknown}"
+  echo "log=$log_file"
+}
+
+llama-keep-alive-stop() {
+  local pid=""
+  local stop_file="$(_llama_keep_alive_stop_file)"
+  local pid_file="$(_llama_keep_alive_pid_file)"
+  local state_file="$(_llama_keep_alive_state_file)"
+  local waited=0
+
+  pid="$(_llama_keep_alive_running_pid 2>/dev/null || true)"
+
+  if [ -z "$pid" ]; then
+    rm -f "$pid_file" "$stop_file"
+    echo "llama.cpp keep-alive is not running"
+    return 0
+  fi
+
+  : > "$stop_file"
+
+  while kill -0 "$pid" >/dev/null 2>&1 && [ "$waited" -lt 10 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+
+  llama-stop >/dev/null 2>&1 || true
+  rm -f "$pid_file" "$stop_file"
+  [ -f "$state_file" ] && sed -n '1,20p' "$state_file"
+}
+
+llama-keep-alive-status() {
+  local pid=""
+  local state_file="$(_llama_keep_alive_state_file)"
+
+  pid="$(_llama_keep_alive_running_pid 2>/dev/null || true)"
+
+  if [ -n "$pid" ]; then
+    echo "llama.cpp keep-alive: running (pid=$pid)"
+  else
+    echo "llama.cpp keep-alive: stopped"
+  fi
+
+  if [ -f "$state_file" ]; then
+    sed -n '1,20p' "$state_file"
+  fi
 }
 
 llama-stop() {
@@ -389,6 +986,46 @@ llama-pull-file() {
   hf download "$repo" "$file" --local-dir "$target"
 }
 
+_llama_auto_tune_on_pull_enabled() {
+  case "${LLAMA_CPP_AUTO_TUNE_ON_PULL:-true}" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+_llama_maybe_tune_after_pull() {
+  local rel="$1"
+  local was_missing="${2:-0}"
+  local profile=""
+
+  if [ "$was_missing" -ne 1 ]; then
+    return 0
+  fi
+
+  _llama_auto_tune_on_pull_enabled || return 0
+
+  if [ ! -x "$LLAMA_CPP_BIN/llama-bench" ]; then
+    echo "Skipping auto-tune for $rel: llama-bench binary not found"
+    return 0
+  fi
+
+  profile="$(_llama_bench_profile_get "$rel")"
+  if [ -n "$profile" ]; then
+    echo "Tuned launch profile already exists for $rel"
+    return 0
+  fi
+
+  echo "Running auto-tune benchmark for $rel..."
+  llama-bench-preset "$rel" || {
+    echo "Auto-tune benchmark failed for $rel"
+    return 0
+  }
+}
+
 llama-list() {
   _llama_list_runnable_models
 }
@@ -451,7 +1088,7 @@ _llama_start_gemma4_model() {
 
   _local_ai_ensure_model_assets "$rel" || return 1
 
-  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/$model_dir")" || {
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/$model_dir" "$rel")" || {
     echo "No $label mmproj file found under $LLAMA_CPP_MODELS/$model_dir"
     return 1
   }
@@ -494,16 +1131,103 @@ run-gemma4-e4b() {
 
 _llama_find_mmproj() {
   local model_dir="$1"
+  local model_ref="$2"
+  local model_path=""
   local candidate
+  local best_candidate=""
+  local best_score=-1
+  local score=0
 
-  for candidate in "mmproj-BF16.gguf" "mmproj-F16.gguf"; do
-    if [ -f "$model_dir/$candidate" ]; then
-      printf '%s/%s\n' "$model_dir" "$candidate"
-      return 0
+  case "$model_ref" in
+    "")
+      ;;
+    /*)
+      model_path="$model_ref"
+      ;;
+    *)
+      model_path="$LLAMA_CPP_MODELS/$model_ref"
+      ;;
+  esac
+
+  for candidate in "$model_dir"/mmproj*.gguf "$model_dir"/*mmproj*.gguf; do
+    [ -f "$candidate" ] || continue
+    score="$(_llama_mmproj_match_score "$model_path" "$candidate")"
+    if [ "$score" -gt "$best_score" ]; then
+      best_candidate="$candidate"
+      best_score="$score"
     fi
   done
 
+  if [ -n "$best_candidate" ]; then
+    printf '%s\n' "$best_candidate"
+    return 0
+  fi
+
   return 1
+}
+
+_llama_gguf_metadata_value() {
+  local gguf="$1"
+  local key="$2"
+
+  [ -f "$gguf" ] || return 1
+  command -v strings >/dev/null 2>&1 || return 1
+
+  strings "$gguf" 2>/dev/null | awk -v key="$key" '
+    {
+      gsub(/[[:cntrl:]]/, "", $0)
+      if (prev == key && length($0) > 0) {
+        print $0
+        exit
+      }
+      prev = $0
+    }
+  '
+}
+
+_llama_mmproj_match_score() {
+  local model_path="$1"
+  local mmproj_path="$2"
+  local score=0
+  local model_basename=""
+  local mmproj_basename=""
+  local model_base_name=""
+  local mmproj_base_name=""
+  local model_repo=""
+  local mmproj_repo=""
+  local mmproj_arch=""
+
+  [ -f "$mmproj_path" ] || {
+    printf '0\n'
+    return 0
+  }
+
+  case "${mmproj_path:t}" in
+    mmproj-BF16.gguf)
+      score=$((score + 2))
+      ;;
+    mmproj-F16.gguf)
+      score=$((score + 1))
+      ;;
+  esac
+
+  if [ -f "$model_path" ]; then
+    model_basename="$(_llama_gguf_metadata_value "$model_path" "general.basename")"
+    mmproj_basename="$(_llama_gguf_metadata_value "$mmproj_path" "general.basename")"
+    model_base_name="$(_llama_gguf_metadata_value "$model_path" "general.base_model.0.name")"
+    mmproj_base_name="$(_llama_gguf_metadata_value "$mmproj_path" "general.base_model.0.name")"
+    model_repo="$(_llama_gguf_metadata_value "$model_path" "general.base_model.0.repo_url")"
+    mmproj_repo="$(_llama_gguf_metadata_value "$mmproj_path" "general.base_model.0.repo_url")"
+
+    [ -n "$model_basename" ] && [ "$model_basename" = "$mmproj_basename" ] && score=$((score + 8))
+    [ -n "$model_base_name" ] && [ "$model_base_name" = "$mmproj_base_name" ] && score=$((score + 8))
+    [ -n "$model_repo" ] && [ "$model_repo" = "$mmproj_repo" ] && score=$((score + 6))
+  fi
+
+  mmproj_arch="$(_llama_gguf_metadata_value "$mmproj_path" "general.architecture")"
+  [ "$mmproj_arch" = "clip" ] && score=$((score + 3))
+
+  printf '%s\n' "$score"
 }
 
 _llama_recommended_model_for_profile() {
@@ -734,8 +1458,14 @@ run-gemma4-26b() {
 
 llama-pull-gemma4-26b() {
   local target="$LLAMA_CPP_MODELS/gemma-4-26B-A4B-it-GGUF"
-  local quant="${1:-q4}"
+  local quant="${1:-recommended}"
   local model_file=""
+  local rel=""
+  local was_missing=0
+
+  if [ "$quant" = "recommended" ] || [ "$quant" = "default" ] || [ "$quant" = "auto" ]; then
+    quant="$(_llama_recommended_quant_for_target 26b)"
+  fi
 
   case "$quant" in
     q4|4bit|recommended|default|balanced)
@@ -759,11 +1489,14 @@ llama-pull-gemma4-26b() {
       ;;
   esac
 
+  rel="gemma-4-26B-A4B-it-GGUF/$model_file"
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
   mkdir -p "$target"
   hf download unsloth/gemma-4-26B-A4B-it-GGUF \
     "$model_file" \
     mmproj-BF16.gguf \
     --local-dir "$target"
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
 llama-pull-gemma4-26b-mmproj() {
@@ -786,8 +1519,14 @@ llama-pull-gemma4-31b-mmproj() {
 
 llama-pull-gemma4-e4b() {
   local target="$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF"
-  local quant="${1:-q8}"
+  local quant="${1:-recommended}"
   local model_file=""
+  local rel=""
+  local was_missing=0
+
+  if [ "$quant" = "recommended" ] || [ "$quant" = "default" ] || [ "$quant" = "auto" ]; then
+    quant="$(_llama_recommended_quant_for_target e4b)"
+  fi
 
   case "$quant" in
     q8|8bit|recommended|default)
@@ -817,17 +1556,26 @@ llama-pull-gemma4-e4b() {
       ;;
   esac
 
+  rel="gemma-4-E4B-it-GGUF/$model_file"
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
   mkdir -p "$target"
   hf download unsloth/gemma-4-E4B-it-GGUF \
     "$model_file" \
     mmproj-BF16.gguf \
     --local-dir "$target"
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
 llama-pull-gemma4-31b() {
   local target="$LLAMA_CPP_MODELS/gemma-4-31B-it-GGUF"
-  local quant="${1:-q4}"
+  local quant="${1:-recommended}"
   local model_file=""
+  local rel=""
+  local was_missing=0
+
+  if [ "$quant" = "recommended" ] || [ "$quant" = "default" ] || [ "$quant" = "auto" ]; then
+    quant="$(_llama_recommended_quant_for_target 31b)"
+  fi
 
   case "$quant" in
     q4|4bit|recommended|default|best)
@@ -851,20 +1599,27 @@ llama-pull-gemma4-31b() {
       ;;
   esac
 
+  rel="gemma-4-31B-it-GGUF/$model_file"
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
   mkdir -p "$target"
   hf download unsloth/gemma-4-31B-it-GGUF \
     "$model_file" \
     mmproj-BF16.gguf \
     --local-dir "$target"
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
 llama-pull-qwen35-27b-q5() {
   local target="$LLAMA_CPP_MODELS/Qwen3.5-27B-GGUF"
+  local rel="Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf"
+  local was_missing=0
 
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
   mkdir -p "$target"
   hf download unsloth/Qwen3.5-27B-GGUF \
     Qwen3.5-27B-UD-Q5_K_XL.gguf \
     --local-dir "$target"
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
 run-qwen35-27b() {
@@ -1043,15 +1798,8 @@ _local_ai_list_importable_models() {
 _local_ai_model_has_mmproj() {
   local rel="$1"
   local model_dir="$LLAMA_CPP_MODELS/${rel%/*}"
-  local candidate
 
-  for candidate in "$model_dir"/mmproj*.gguf "$model_dir"/*mmproj*.gguf; do
-    if [ -f "$candidate" ]; then
-      return 0
-    fi
-  done
-
-  return 1
+  _llama_find_mmproj "$model_dir" "$rel" >/dev/null 2>&1
 }
 
 _local_ai_lmstudio_model_key() {
@@ -1128,6 +1876,131 @@ _local_ai_resolve_model_target() {
       ;;
     *)
       echo "Unknown model target: $target"
+      return 1
+      ;;
+  esac
+}
+
+_llama_recommended_quant_for_target() {
+  local target="${1:-current}"
+  local rel=""
+  local profile="$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE")"
+
+  case "$target" in
+    31b|gemma4-31b|gemma-4-31b)
+      rel="gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      ;;
+    26b|gemma4-26b|gemma-4-26b)
+      rel="gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+      ;;
+    e4b|gemma4-e4b|gemma-4-e4b)
+      if [ "$profile" = "mac-mini-16g" ]; then
+        printf '%s\n' "q4"
+      else
+        printf '%s\n' "q8"
+      fi
+      return 0
+      ;;
+    qwen|qwen27|qwen3.5-27b)
+      printf '%s\n' "q5"
+      return 0
+      ;;
+    *)
+      rel="$(_local_ai_resolve_model_target "$target")" || return 1
+      ;;
+  esac
+
+  case "$rel" in
+    gemma-4-31B-it-GGUF/*Q8_0.gguf)
+      printf '%s\n' "q8"
+      ;;
+    gemma-4-31B-it-GGUF/*Q6*.gguf)
+      printf '%s\n' "q6"
+      ;;
+    gemma-4-31B-it-GGUF/*Q5*.gguf)
+      printf '%s\n' "q5"
+      ;;
+    gemma-4-31B-it-GGUF/*)
+      printf '%s\n' "q4"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*Q8_0.gguf)
+      printf '%s\n' "q8"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*Q6*.gguf)
+      printf '%s\n' "q6"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*Q5*.gguf)
+      printf '%s\n' "q5"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*)
+      printf '%s\n' "q4"
+      ;;
+    gemma-4-E4B-it-GGUF/*Q8_0.gguf)
+      printf '%s\n' "q8"
+      ;;
+    gemma-4-E4B-it-GGUF/*Q6*.gguf)
+      printf '%s\n' "q6"
+      ;;
+    gemma-4-E4B-it-GGUF/*Q5_K_M.gguf)
+      printf '%s\n' "q5km"
+      ;;
+    gemma-4-E4B-it-GGUF/*Q5*.gguf)
+      printf '%s\n' "q5"
+      ;;
+    gemma-4-E4B-it-GGUF/*Q4_K_M.gguf)
+      printf '%s\n' "q4km"
+      ;;
+    gemma-4-E4B-it-GGUF/*)
+      printf '%s\n' "q4"
+      ;;
+    Qwen3.5-27B-GGUF/*)
+      printf '%s\n' "q5"
+      ;;
+    *)
+      echo "No recommended quant mapping for $target"
+      return 1
+      ;;
+  esac
+}
+
+llama-recommend-quant() {
+  local target="${1:-current}"
+  local quant=""
+  local rel=""
+
+  quant="$(_llama_recommended_quant_for_target "$target")" || return 1
+  rel="$(_local_ai_resolve_model_target "$target")" 2>/dev/null || true
+
+  if [ -n "$rel" ]; then
+    echo "target=$target"
+    echo "model=$rel"
+  fi
+  echo "recommended_quant=$quant"
+}
+
+llama-pull-recommended() {
+  local target="${1:-current}"
+  local quant=""
+  local rel=""
+
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  quant="$(_llama_recommended_quant_for_target "$target")" || return 1
+
+  case "$rel" in
+    gemma-4-31B-it-GGUF/*)
+      llama-pull-gemma4-31b "$quant"
+      ;;
+    gemma-4-26B-A4B-it-GGUF/*)
+      llama-pull-gemma4-26b "$quant"
+      ;;
+    gemma-4-E4B-it-GGUF/*)
+      llama-pull-gemma4-e4b "$quant"
+      ;;
+    Qwen3.5-27B-GGUF/*)
+      llama-pull-qwen35-27b-q5
+      ;;
+    *)
+      echo "No recommended pull mapping for $target"
       return 1
       ;;
   esac
@@ -1746,9 +2619,9 @@ alias gemma4-switch-best='llama-switch best'
 alias gemma4-switch-vision='llama-switch vision'
 alias gemma4-switch-balanced='llama-switch balanced'
 alias gemma4-switch-fast='llama-switch fast'
-alias gemma4-best-pull='llama-pull-gemma4-31b'
-alias gemma4-balanced-pull='llama-pull-gemma4-26b'
-alias gemma4-fast-pull='llama-pull-gemma4-e4b'
+alias gemma4-best-pull='llama-pull-recommended best'
+alias gemma4-balanced-pull='llama-pull-recommended balanced'
+alias gemma4-fast-pull='llama-pull-recommended fast'
 alias gemma4-mini-pull='llama-pull-gemma4-e4b q8'
 alias gemma4-31b-pull='llama-pull-gemma4-31b'
 alias gemma4-31b-mmproj-pull='llama-pull-gemma4-31b-mmproj'

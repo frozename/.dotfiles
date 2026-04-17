@@ -245,28 +245,181 @@ _llama_bench_history_file() {
   printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/llama-bench-history.tsv"
 }
 
+_llama_llama_cpp_build_id() {
+  if [ -d "$LLAMA_CPP_SRC/.git" ]; then
+    git -C "$LLAMA_CPP_SRC" rev-parse --short HEAD 2>/dev/null && return 0
+  fi
+
+  if [ -x "$LLAMA_CPP_BIN/llama-server" ]; then
+    stat -f 'bin-%m' "$LLAMA_CPP_BIN/llama-server" 2>/dev/null && return 0
+  fi
+
+  printf '%s\n' "unknown"
+}
+
+_llama_curated_field_for_rel() {
+  local rel="$1"
+  local field="$2"
+
+  _llama_curated_catalog | awk -F '\t' -v rel="$rel" -v field="$field" '$6 == rel { print $field; exit }'
+}
+
+_llama_model_class_for_rel() {
+  local rel="$1"
+  local class=""
+  local repo=""
+  local info=""
+  local pipeline=""
+
+  class="$(_llama_curated_field_for_rel "$rel" 4)"
+  if [ -n "$class" ]; then
+    printf '%s\n' "$class"
+    return 0
+  fi
+
+  repo="$(_llama_hf_repo_for_rel "$rel" 2>/dev/null || true)"
+  if [ -z "$repo" ] && [[ "$rel" == */* ]] && [ -n "${LOCAL_AI_DISCOVERY_AUTHOR:-}" ]; then
+    repo="${LOCAL_AI_DISCOVERY_AUTHOR}/${rel%%/*}"
+  fi
+  if [ -n "$repo" ] && command -v jq >/dev/null 2>&1; then
+    info="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+    if [ -n "$info" ]; then
+      pipeline="$(printf '%s' "$info" | jq -r '.pipeline_tag // ""' 2>/dev/null || true)"
+      case "$pipeline" in
+        image-text-to-text|visual-question-answering|image-to-text)
+          printf '%s\n' "multimodal"
+          return 0
+          ;;
+      esac
+    fi
+  fi
+
+  case "$rel" in
+    gemma-4-*|Qwen3.6-35B-A3B-GGUF/*)
+      printf '%s\n' "multimodal"
+      ;;
+    Qwen3.5-*|DeepSeek-*|deepseek-*|*R1*)
+      printf '%s\n' "reasoning"
+      ;;
+    *)
+      printf '%s\n' "general"
+      ;;
+  esac
+}
+
+_llama_bench_default_mode_for_rel() {
+  local rel="$1"
+  local repo=""
+  local mmproj_file=""
+  local class=""
+  local local_mmproj=""
+
+  case "$rel" in
+    Qwen3.5-27B-GGUF/*)
+      printf '%s\n' "text"
+      return 0
+      ;;
+  esac
+
+  if [ -f "$LLAMA_CPP_MODELS/$rel" ]; then
+    local_mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/${rel%/*}" "$rel" 2>/dev/null || true)"
+    if [ -n "$local_mmproj" ]; then
+      printf '%s\n' "vision"
+      return 0
+    fi
+  fi
+
+  if repo="$(_llama_hf_repo_for_rel "$rel" 2>/dev/null)"; then
+    :
+  else
+    repo=""
+  fi
+  if [ -n "$repo" ]; then
+    if mmproj_file="$(_llama_hf_mmproj_file_for_repo "$repo" 2>/dev/null)"; then
+      :
+    else
+      mmproj_file=""
+    fi
+    if [ -n "$mmproj_file" ]; then
+      printf '%s\n' "vision"
+      return 0
+    fi
+  fi
+
+  if class="$(_llama_model_class_for_rel "$rel" 2>/dev/null)"; then
+    :
+  else
+    class=""
+  fi
+  case "$class" in
+    multimodal)
+      printf '%s\n' "vision"
+      ;;
+    *)
+      printf '%s\n' "text"
+      ;;
+  esac
+}
+
+_llama_bench_mode_for_rel_and_args() {
+  local rel="$1"
+  shift
+
+  if [ $# -gt 0 ] && _llama_start_has_mmproj "$@"; then
+    printf '%s\n' "vision"
+    return 0
+  fi
+
+  _llama_bench_default_mode_for_rel "$rel"
+}
+
+_llama_bench_context_machine() {
+  _local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE"
+}
+
+_llama_bench_context_ctx() {
+  _llama_ctx_for_model "$1"
+}
+
 _llama_bench_profile_get() {
   local rel="$1"
+  local mode="${2:-$(_llama_bench_default_mode_for_rel "$rel")}"
+  local ctx="${3:-$(_llama_bench_context_ctx "$rel")}"
+  local machine="${4:-$(_llama_bench_context_machine)}"
+  local build="${5:-$(_llama_llama_cpp_build_id)}"
   local file="$(_llama_bench_profile_file)"
 
   if [ ! -f "$file" ]; then
     return 1
   fi
 
-  awk -F '\t' -v rel="$rel" '$1 == rel { print $2 }' "$file" | tail -n 1
+  awk -F '\t' -v machine="$machine" -v rel="$rel" -v mode="$mode" -v ctx="$ctx" -v build="$build" '
+    NF >= 9 && $1 == machine && $2 == rel && $3 == mode && $4 == ctx && $5 == build { print $6; found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$file" | tail -n 1 && return 0
+
+  awk -F '\t' -v rel="$rel" 'NF == 5 && $1 == rel { print $2; found = 1 } END { exit(found ? 0 : 1) }' "$file" | tail -n 1
 }
 
 _llama_bench_history_append() {
   local rel="$1"
-  local profile="$2"
-  local gen_ts="$3"
-  local prompt_ts="$4"
+  local mode="$2"
+  local ctx="$3"
+  local build="$4"
+  local profile="$5"
+  local gen_ts="$6"
+  local prompt_ts="$7"
+  local machine="$(_llama_bench_context_machine)"
   local file="$(_llama_bench_history_file)"
 
   _local_ai_ensure_runtime_dir
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+    "$machine" \
     "$rel" \
+    "$mode" \
+    "$ctx" \
+    "$build" \
     "$profile" \
     "$gen_ts" \
     "$prompt_ts" \
@@ -275,9 +428,13 @@ _llama_bench_history_append() {
 
 _llama_bench_profile_set() {
   local rel="$1"
-  local profile="$2"
-  local gen_ts="$3"
-  local prompt_ts="$4"
+  local mode="$2"
+  local ctx="$3"
+  local build="$4"
+  local profile="$5"
+  local gen_ts="$6"
+  local prompt_ts="$7"
+  local machine="$(_llama_bench_context_machine)"
   local file="$(_llama_bench_profile_file)"
   local tmp
 
@@ -285,12 +442,99 @@ _llama_bench_profile_set() {
   tmp="$(mktemp "${TMPDIR:-/tmp}/llama-bench-profiles.XXXXXX")" || return 1
 
   if [ -f "$file" ]; then
-    awk -F '\t' -v rel="$rel" '$1 != rel { print $0 }' "$file" > "$tmp"
+    awk -F '\t' -v machine="$machine" -v rel="$rel" -v mode="$mode" -v ctx="$ctx" -v build="$build" '
+      !(NF >= 9 && $1 == machine && $2 == rel && $3 == mode && $4 == ctx && $5 == build) { print $0 }
+    ' "$file" > "$tmp"
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$profile" "$gen_ts" "$prompt_ts" "$(date +%Y-%m-%dT%H:%M:%S%z)" >> "$tmp"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$machine" "$rel" "$mode" "$ctx" "$build" "$profile" "$gen_ts" "$prompt_ts" "$(date +%Y-%m-%dT%H:%M:%S%z)" >> "$tmp"
   mv "$tmp" "$file"
-  _llama_bench_history_append "$rel" "$profile" "$gen_ts" "$prompt_ts"
+  _llama_bench_history_append "$rel" "$mode" "$ctx" "$build" "$profile" "$gen_ts" "$prompt_ts"
+}
+
+_llama_bench_vision_file() {
+  printf '%s\n' "${LLAMA_CPP_BENCH_VISION_FILE:-$LOCAL_AI_RUNTIME_DIR/bench-vision.tsv}"
+}
+
+_llama_bench_reference_image() {
+  local override="${LOCAL_AI_BENCH_IMAGE:-}"
+  local image_path=""
+
+  if [ -n "$override" ]; then
+    if [ ! -f "$override" ]; then
+      echo "LOCAL_AI_BENCH_IMAGE=$override: file not found" >&2
+      return 1
+    fi
+    printf '%s\n' "$override"
+    return 0
+  fi
+
+  image_path="$LOCAL_AI_RUNTIME_DIR/bench-assets/reference-1x1.png"
+  if [ ! -f "$image_path" ]; then
+    mkdir -p "${image_path:h}"
+    printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgGAWDHAAAEAABSsRJZwAAAABJRU5ErkJggg==' \
+      | base64 -d > "$image_path" || {
+        rm -f "$image_path"
+        echo "Unable to decode embedded reference image" >&2
+        return 1
+      }
+  fi
+  printf '%s\n' "$image_path"
+}
+
+_llama_bench_vision_record() {
+  local machine="$1"
+  local rel="$2"
+  local ctx="$3"
+  local build="$4"
+  local load_ms="$5"
+  local image_encode_ms="$6"
+  local prompt_tps="$7"
+  local gen_tps="$8"
+  local file="$(_llama_bench_vision_file)"
+  local tmp
+
+  _local_ai_ensure_runtime_dir
+  mkdir -p "${file:h}"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/llama-bench-vision.XXXXXX")" || return 1
+
+  if [ -f "$file" ]; then
+    awk -F '\t' -v machine="$machine" -v rel="$rel" -v ctx="$ctx" -v build="$build" '
+      !($1 == machine && $2 == rel && $3 == ctx && $4 == build) { print $0 }
+    ' "$file" > "$tmp"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$machine" "$rel" "$ctx" "$build" \
+    "${load_ms:-0}" "${image_encode_ms:-0}" \
+    "$prompt_tps" "$gen_tps" \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+_llama_bench_vision_latest() {
+  local rel="$1"
+  local machine="${2:-$(_llama_bench_context_machine)}"
+  local build="${3:-$(_llama_llama_cpp_build_id)}"
+  local file="$(_llama_bench_vision_file)"
+
+  [ -f "$file" ] || return 1
+  awk -F '\t' -v machine="$machine" -v rel="$rel" -v build="$build" '
+    $1 == machine && $2 == rel && $4 == build { print $0; found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$file" | tail -n 1
+}
+
+_llama_bench_vision_auto_enabled() {
+  case "${LLAMA_CPP_AUTO_BENCH_VISION:-true}" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 _llama_server_profile_args() {
@@ -401,6 +645,7 @@ _llama_wait_for_ready() {
 
 llama-bench-preset() {
   local target="${1:-current}"
+  local mode_arg="${2:-auto}"
   local rel=""
   local model_path=""
   local profile=""
@@ -411,6 +656,9 @@ llama-bench-preset() {
   local best_gen_ts="-1"
   local best_prompt_ts="-1"
   local bench_args_str=""
+  local mode=""
+  local ctx=""
+  local build=""
 
   command -v jq >/dev/null 2>&1 || {
     echo "jq is required for llama-bench-preset"
@@ -428,10 +676,24 @@ llama-bench-preset() {
   fi
 
   model_path="$(_llama_require_model "$rel")" || return 1
+  case "$mode_arg" in
+    auto|"")
+      mode="$(_llama_bench_default_mode_for_rel "$rel")"
+      ;;
+    text|vision)
+      mode="$mode_arg"
+      ;;
+    *)
+      echo "Usage: llama-bench-preset [target] [auto|text|vision]"
+      return 1
+      ;;
+  esac
+  ctx="$(_llama_bench_context_ctx "$rel")"
+  build="$(_llama_llama_cpp_build_id)"
 
   for profile in default throughput conservative; do
     bench_args_str="$(_llama_bench_profile_args "$profile")"
-    echo "Benchmarking $rel with profile '$profile'..."
+    echo "Benchmarking $rel with profile '$profile' (mode=$mode ctx=$ctx build=$build)..."
     output="$("$LLAMA_CPP_BIN/llama-bench" -m "$model_path" -pg 256,64 -r 1 -ngl 999 ${(z)bench_args_str} -o jsonl 2>/dev/null)" || {
       echo "Benchmark failed for profile '$profile'"
       continue
@@ -455,9 +717,139 @@ llama-bench-preset() {
     return 1
   fi
 
-  _llama_bench_profile_set "$rel" "$best_profile" "$best_gen_ts" "$best_prompt_ts" || return 1
+  _llama_bench_profile_set "$rel" "$mode" "$ctx" "$build" "$best_profile" "$best_gen_ts" "$best_prompt_ts" || return 1
   echo "Saved tuned launch profile for $rel"
+  echo "machine=$(_llama_bench_context_machine) mode=$mode ctx=$ctx build=$build"
   echo "profile=$best_profile gen_tps=$best_gen_ts prompt_tps=$best_prompt_ts"
+}
+
+llama-bench-vision() {
+  local target="${1:-current}"
+  local rel=""
+  local model_path=""
+  local model_dir=""
+  local mmproj=""
+  local image=""
+  local ctx=""
+  local build=""
+  local machine=""
+  local bin="$LLAMA_CPP_BIN/llama-mtmd-cli"
+  local stderr_file=""
+  local parsed=""
+  local load_ms=""
+  local image_encode_ms=""
+  local prompt_tps=""
+  local gen_tps=""
+
+  if [ ! -x "$bin" ]; then
+    echo "llama-mtmd-cli binary not found: $bin"
+    return 1
+  fi
+
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  if _local_ai_is_named_preset "$target"; then
+    _local_ai_ensure_model_assets "$rel" || return 1
+  fi
+
+  model_path="$(_llama_require_model "$rel")" || return 1
+  model_dir="$LLAMA_CPP_MODELS/${rel%/*}"
+  mmproj="$(_llama_find_mmproj "$model_dir" "$rel" 2>/dev/null || true)"
+  if [ -z "$mmproj" ]; then
+    echo "No mmproj sibling found for $rel; vision bench requires a multimodal projector"
+    return 1
+  fi
+
+  image="$(_llama_bench_reference_image)" || return 1
+  ctx="$(_llama_bench_context_ctx "$rel")"
+  build="$(_llama_llama_cpp_build_id)"
+  machine="$(_llama_bench_context_machine)"
+
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/llama-bench-vision.XXXXXX")" || return 1
+
+  echo "Vision-benching $rel (image=$image ctx=$ctx build=$build)..."
+  "$bin" \
+    -m "$model_path" \
+    --mmproj "$mmproj" \
+    --image "$image" \
+    -p "Describe the image in one sentence." \
+    -n 32 \
+    -ngl 999 \
+    --no-warmup \
+    >/dev/null 2>"$stderr_file" || {
+      echo "llama-mtmd-cli failed; tail of stderr:"
+      tail -20 "$stderr_file"
+      rm -f "$stderr_file"
+      return 1
+    }
+
+  parsed="$(awk '
+    /load time =/ && load_ms == "" {
+      for (i=1; i<=NF; i++) if ($i == "ms") { load_ms = $(i-1); break }
+    }
+    /image slice encoded in/ && encode_ms == "" {
+      for (i=1; i<=NF; i++) if ($i == "ms") { encode_ms = $(i-1); break }
+    }
+    /prompt eval time =/ && prompt_tps == "" {
+      for (i=1; i<=NF; i++) if ($i == "tokens" && $(i+1) == "per" && $(i+2) == "second)") {
+        prompt_tps = $(i-1); break
+      }
+    }
+    /eval time =/ && !/prompt/ && gen_tps == "" {
+      for (i=1; i<=NF; i++) if ($i == "tokens" && $(i+1) == "per" && $(i+2) == "second)") {
+        gen_tps = $(i-1); break
+      }
+    }
+    END {
+      printf "%s\t%s\t%s\t%s\n", load_ms, encode_ms, prompt_tps, gen_tps
+    }
+  ' "$stderr_file")"
+
+  IFS=$'\t' read -r load_ms image_encode_ms prompt_tps gen_tps <<< "$parsed"
+
+  if [ -z "$prompt_tps" ] || [ -z "$gen_tps" ]; then
+    echo "Failed to parse timing from llama-mtmd-cli output (saved: $stderr_file)"
+    return 1
+  fi
+
+  _llama_bench_vision_record "$machine" "$rel" "$ctx" "$build" \
+    "$load_ms" "$image_encode_ms" "$prompt_tps" "$gen_tps" || {
+      echo "Failed to save vision bench record"
+      rm -f "$stderr_file"
+      return 1
+    }
+
+  rm -f "$stderr_file"
+
+  echo "Saved vision bench record for $rel"
+  echo "machine=$machine rel=$rel ctx=$ctx build=$build"
+  printf 'load_ms=%s image_encode_ms=%s prompt_tps=%s gen_tps=%s\n' \
+    "${load_ms:-0}" "${image_encode_ms:-0}" "$prompt_tps" "$gen_tps"
+}
+
+llama-bench-vision-show() {
+  local target="${1:-current}"
+  local rel=""
+  local record=""
+  local machine="" ctx="" build="" load_ms="" image_encode_ms="" prompt_tps="" gen_tps="" updated_at=""
+  local row_rel=""
+
+  rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  record="$(_llama_bench_vision_latest "$rel" 2>/dev/null || true)"
+  if [ -z "$record" ]; then
+    echo "No vision bench record for $rel on machine=$(_llama_bench_context_machine) build=$(_llama_llama_cpp_build_id)"
+    return 1
+  fi
+
+  IFS=$'\t' read -r machine row_rel ctx build load_ms image_encode_ms prompt_tps gen_tps updated_at <<< "$record"
+  echo "machine=$machine"
+  echo "rel=$row_rel"
+  echo "ctx=$ctx"
+  echo "build=$build"
+  echo "load_ms=$load_ms"
+  echo "image_encode_ms=$image_encode_ms"
+  echo "prompt_tps=$prompt_tps"
+  echo "gen_tps=$gen_tps"
+  echo "updated_at=$updated_at"
 }
 
 llama-bench-show() {
@@ -465,16 +857,32 @@ llama-bench-show() {
   local rel=""
   local profile=""
   local file="$(_llama_bench_profile_file)"
+  local mode=""
+  local ctx=""
+  local build=""
+  local machine=""
 
   rel="$(_local_ai_resolve_model_target "$target")" || return 1
-  profile="$(_llama_bench_profile_get "$rel")"
+  mode="$(_llama_bench_default_mode_for_rel "$rel")"
+  ctx="$(_llama_bench_context_ctx "$rel")"
+  build="$(_llama_llama_cpp_build_id)"
+  machine="$(_llama_bench_context_machine)"
+  profile="$(_llama_bench_profile_get "$rel" "$mode" "$ctx" "$machine" "$build")"
 
   if [ -z "$profile" ]; then
     echo "No tuned launch profile recorded for $rel"
     return 1
   fi
 
-  awk -F '\t' -v rel="$rel" '$1 == rel { printf "model=%s\nprofile=%s\ngen_tps=%s\nprompt_tps=%s\nupdated_at=%s\n", $1, $2, $3, $4, $5 }' "$file" | tail -n 5
+  awk -F '\t' -v machine="$machine" -v rel="$rel" -v mode="$mode" -v ctx="$ctx" -v build="$build" '
+    NF >= 9 && $1 == machine && $2 == rel && $3 == mode && $4 == ctx && $5 == build {
+      printf "machine=%s\nmodel=%s\nmode=%s\nctx=%s\nbuild=%s\nprofile=%s\ngen_tps=%s\nprompt_tps=%s\nupdated_at=%s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9
+      found = 1
+    }
+    END {
+      if (!found) exit 1
+    }
+  ' "$file" | tail -n 9 || awk -F '\t' -v rel="$rel" 'NF == 5 && $1 == rel { printf "machine=legacy\nmodel=%s\nmode=legacy\nctx=legacy\nbuild=legacy\nprofile=%s\ngen_tps=%s\nprompt_tps=%s\nupdated_at=%s\n", $1, $2, $3, $4, $5 }' "$file" | tail -n 9
   echo "launch_args=$(_llama_server_profile_args "$profile")"
 }
 
@@ -488,14 +896,1245 @@ llama-bench-history() {
   fi
 
   if [ "$target" = "all" ]; then
-    awk -F '\t' '{ printf "%s | %s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }' "$file" | tail -n 20
+    awk -F '\t' '
+      NF >= 10 { printf "%s | %s | model=%s | mode=%s | ctx=%s | build=%s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10; next }
+      NF == 6 { printf "%s | legacy | model=%s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }
+    ' "$file" | tail -n 20
     return 0
   fi
 
   local rel=""
   rel="$(_local_ai_resolve_model_target "$target")" || return 1
-  awk -F '\t' -v rel="$rel" '$2 == rel { printf "%s | %s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }' "$file" | tail -n 20
+  awk -F '\t' -v rel="$rel" '
+    NF >= 10 && $3 == rel { printf "%s | %s | model=%s | mode=%s | ctx=%s | build=%s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 }
+    NF == 6 && $2 == rel { printf "%s | legacy | model=%s | profile=%s | gen_tps=%s | prompt_tps=%s | launch_args=%s\n", $1, $2, $3, $4, $5, $6 }
+  ' "$file" | tail -n 20
 }
+
+_llama_bench_latest_record() {
+  local rel="$1"
+  local mode="${2:-$(_llama_bench_default_mode_for_rel "$rel")}"
+  local ctx="${3:-$(_llama_bench_context_ctx "$rel")}"
+  local machine="${4:-$(_llama_bench_context_machine)}"
+  local build="${5:-$(_llama_llama_cpp_build_id)}"
+  local file="$(_llama_bench_profile_file)"
+
+  [ -f "$file" ] || return 1
+  awk -F '\t' -v machine="$machine" -v rel="$rel" -v mode="$mode" -v ctx="$ctx" -v build="$build" '
+    NF >= 9 && $1 == machine && $2 == rel && $3 == mode && $4 == ctx && $5 == build { print $0; found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$file" | tail -n 1 && return 0
+
+  awk -F '\t' -v rel="$rel" '
+    NF == 5 && $1 == rel {
+      printf "legacy\t%s\tlegacy\tlegacy\tlegacy\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5
+      found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file" | tail -n 1
+}
+
+_llama_custom_catalog_file() {
+  printf '%s\n' "${LOCAL_AI_CUSTOM_CATALOG_FILE:-$LOCAL_AI_RUNTIME_DIR/curated-models.tsv}"
+}
+
+_llama_curated_catalog() {
+  cat <<'EOF'
+gemma4-e4b-q8	Gemma 4 E4B Q8	gemma4	multimodal	fast	gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf	unsloth/gemma-4-E4B-it-GGUF
+gemma4-e4b-q4	Gemma 4 E4B Q4	gemma4	multimodal	compact	gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf	unsloth/gemma-4-E4B-it-GGUF
+gemma4-26b-q4	Gemma 4 26B Q4	gemma4	multimodal	balanced	gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf	unsloth/gemma-4-26B-A4B-it-GGUF
+gemma4-31b-q4	Gemma 4 31B Q4	gemma4	multimodal	quality	gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf	unsloth/gemma-4-31B-it-GGUF
+qwen36-q3s	Qwen 3.6 35B-A3B Q3_K_S	qwen36	reasoning	compact	Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf	unsloth/Qwen3.6-35B-A3B-GGUF
+qwen36-q4m	Qwen 3.6 35B-A3B Q4_K_M	qwen36	reasoning	balanced	Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf	unsloth/Qwen3.6-35B-A3B-GGUF
+qwen36-q4	Qwen 3.6 35B-A3B Q4_K_XL	qwen36	reasoning	quality	Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf	unsloth/Qwen3.6-35B-A3B-GGUF
+qwen27-q5	Qwen 3.5 27B Q5	qwen35	reasoning	legacy-balanced	Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf	unsloth/Qwen3.5-27B-GGUF
+EOF
+
+  if [ -f "$(_llama_custom_catalog_file)" ]; then
+    awk -F '\t' 'NF >= 7 && $0 !~ /^[[:space:]]*#/ { print $0 }' "$(_llama_custom_catalog_file)"
+  fi
+}
+
+_llama_curated_meta_for_rel() {
+  local rel="$1"
+
+  _llama_curated_catalog | awk -F '\t' -v rel="$rel" '
+    $6 == rel { print $0; found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_llama_hf_model_info_cache_file() {
+  local repo="$1"
+  local safe_repo="${repo//\//__}"
+
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/hf-model-info-${safe_repo}.json"
+}
+
+_llama_hf_cache_fresh() {
+  local file="$1"
+  local ttl="${LOCAL_AI_HF_CACHE_TTL_SECONDS:-43200}"
+  local now=""
+  local mtime=""
+
+  [ -f "$file" ] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$file" 2>/dev/null || printf 0)"
+  [ $((now - mtime)) -lt "$ttl" ]
+}
+
+_llama_hf_enabled() {
+  case "${LOCAL_AI_RECOMMENDATIONS_SOURCE:-hf}" in
+    off|none|local|false|FALSE|0)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+_llama_hf_fetch_model_info() {
+  local repo="$1"
+  local cache_file="$(_llama_hf_model_info_cache_file "$repo")"
+  local tmp=""
+
+  _llama_hf_enabled || return 1
+  _local_ai_ensure_runtime_dir
+
+  if _llama_hf_cache_fresh "$cache_file"; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hf-model-info.XXXXXX")" || return 1
+  if curl -fsSL "https://huggingface.co/api/models/$repo" -o "$tmp" 2>/dev/null; then
+    mv "$tmp" "$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  [ -f "$cache_file" ] && cat "$cache_file"
+}
+
+_llama_hf_discovery_cache_file() {
+  local author="${1:-${LOCAL_AI_DISCOVERY_AUTHOR:-unsloth}}"
+  local limit="${2:-${LOCAL_AI_DISCOVERY_LIMIT:-24}}"
+  local search="${3:-${LOCAL_AI_DISCOVERY_SEARCH:-GGUF}}"
+  local safe_key="${author//\//__}-${search//[^A-Za-z0-9._-]/_}-${limit}"
+
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/hf-discovery-${safe_key}.json"
+}
+
+_llama_hf_repo_tree_cache_file() {
+  local repo="$1"
+  local safe_repo="${repo//\//__}"
+
+  printf '%s\n' "$LOCAL_AI_RUNTIME_DIR/hf-tree-${safe_repo}.json"
+}
+
+_llama_hf_fetch_discovery_feed() {
+  local author="${1:-${LOCAL_AI_DISCOVERY_AUTHOR:-unsloth}}"
+  local limit="${2:-${LOCAL_AI_DISCOVERY_LIMIT:-24}}"
+  local search="${3:-${LOCAL_AI_DISCOVERY_SEARCH:-GGUF}}"
+  local cache_file="$(_llama_hf_discovery_cache_file "$author" "$limit" "$search")"
+  local tmp=""
+
+  _llama_hf_enabled || return 1
+  _local_ai_ensure_runtime_dir
+
+  if _llama_hf_cache_fresh "$cache_file"; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hf-discovery.XXXXXX")" || return 1
+  if curl -fsSL "https://huggingface.co/api/models?author=$author&search=$search&sort=downloads&direction=-1&limit=$limit&full=true" -o "$tmp" 2>/dev/null; then
+    mv "$tmp" "$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  [ -f "$cache_file" ] && cat "$cache_file"
+}
+
+_llama_hf_fetch_repo_tree() {
+  local repo="$1"
+  local cache_file="$(_llama_hf_repo_tree_cache_file "$repo")"
+  local tmp=""
+
+  _llama_hf_enabled || return 1
+  _local_ai_ensure_runtime_dir
+
+  if _llama_hf_cache_fresh "$cache_file"; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hf-tree.XXXXXX")" || return 1
+  if curl -fsSL "https://huggingface.co/api/models/$repo/tree/main?recursive=1&expand=1" -o "$tmp" 2>/dev/null; then
+    mv "$tmp" "$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  [ -f "$cache_file" ] && cat "$cache_file"
+}
+
+_llama_hf_repo_for_rel() {
+  local rel="$1"
+
+  _llama_curated_catalog | awk -F '\t' -v rel="$rel" '$6 == rel { print $7; exit }'
+}
+
+_llama_hf_summary_for_rel() {
+  local rel="$1"
+  local repo=""
+  local json=""
+  local downloads=""
+  local likes=""
+  local updated=""
+  local pipeline=""
+  local file_name="${rel:t}"
+
+  repo="$(_llama_hf_repo_for_rel "$rel")"
+  [ -n "$repo" ] || return 1
+
+  json="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+  [ -n "$json" ] || return 1
+
+  downloads="$(printf '%s\n' "$json" | jq -r '.downloads // "n/a"' 2>/dev/null)"
+  likes="$(printf '%s\n' "$json" | jq -r '.likes // "n/a"' 2>/dev/null)"
+  updated="$(printf '%s\n' "$json" | jq -r '.lastModified // "n/a"' 2>/dev/null)"
+  pipeline="$(printf '%s\n' "$json" | jq -r '.pipeline_tag // .pipelineTag // "n/a"' 2>/dev/null)"
+
+  printf 'repo=%s downloads=%s likes=%s updated=%s task=%s file=%s\n' \
+    "$repo" "$downloads" "$likes" "$updated" "$pipeline" "$file_name"
+}
+
+_llama_rel_from_repo_and_file() {
+  local repo="$1"
+  local file="$2"
+
+  if [[ "$file" == */* ]]; then
+    printf '%s\n' "$file"
+  else
+    printf '%s/%s\n' "${repo##*/}" "$file"
+  fi
+}
+
+_llama_hf_repo_file_info() {
+  local repo="$1"
+  local file="$2"
+  local json=""
+  local query_file="$file"
+
+  json="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+  [ -n "$json" ] || return 1
+
+  if [[ "$query_file" != */* ]]; then
+    printf '%s\n' "$json" | jq -c --arg file "$query_file" '
+      .siblings[]?
+      | select(.rfilename == $file or (.rfilename | endswith("/" + $file)))
+      | .
+    ' 2>/dev/null | head -n 1
+  else
+    printf '%s\n' "$json" | jq -c --arg file "$query_file" '
+      .siblings[]?
+      | select(.rfilename == $file)
+      | .
+    ' 2>/dev/null | head -n 1
+  fi
+}
+
+_llama_hf_file_size_bytes() {
+  local repo="$1"
+  local file="$2"
+  local json=""
+  local query_file="$file"
+
+  json="$(_llama_hf_fetch_repo_tree "$repo" 2>/dev/null || true)"
+  [ -n "$json" ] || return 1
+
+  if [[ "$query_file" != */* ]]; then
+    printf '%s\n' "$json" | jq -r --arg file "$query_file" '
+      [.[] | select(.path == $file or (.path | endswith("/" + $file))) | .size // .lfs.size][0] // empty
+    ' 2>/dev/null
+  else
+    printf '%s\n' "$json" | jq -r --arg file "$query_file" '
+      [.[] | select(.path == $file) | .size // .lfs.size][0] // empty
+    ' 2>/dev/null
+  fi
+}
+
+_llama_hf_mmproj_file_for_repo() {
+  local repo="$1"
+  local json=""
+
+  json="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+  [ -n "$json" ] || return 1
+
+  printf '%s\n' "$json" | jq -r '
+    [.siblings[]?.rfilename
+      | select(test("mmproj.*\\.gguf$"; "i"))
+    ][0] // empty
+  ' 2>/dev/null
+}
+
+_llama_hf_human_size() {
+  local bytes="${1:-0}"
+
+  case "$bytes" in
+    ''|*[!0-9]*)
+      printf '%s\n' "n/a"
+      return 0
+      ;;
+  esac
+
+  awk -v bytes="$bytes" '
+    function human(x) {
+      split("B KiB MiB GiB TiB", units, " ")
+      i = 1
+      while (x >= 1024 && i < 5) {
+        x /= 1024
+        i++
+      }
+      if (i == 1) {
+        printf "%d %s", x, units[i]
+      } else {
+        printf "%.1f %s", x, units[i]
+      }
+    }
+    BEGIN { human(bytes) }
+  '
+  printf '\n'
+}
+
+_llama_hf_repo_for_rel_or_repo() {
+  local rel_or_repo="$1"
+  local repo=""
+
+  if [[ "$rel_or_repo" == */* ]] && [[ "$rel_or_repo" != *.gguf ]]; then
+    printf '%s\n' "$rel_or_repo"
+    return 0
+  fi
+
+  repo="$(_llama_hf_repo_for_rel "$rel_or_repo")"
+  [ -n "$repo" ] && printf '%s\n' "$repo"
+}
+
+_llama_quant_from_rel() {
+  local rel="$1"
+
+  case "$rel" in
+    *Q8_0.gguf)
+      printf '%s\n' "q8"
+      ;;
+    *UD-Q6_K_XL.gguf)
+      printf '%s\n' "q6"
+      ;;
+    *UD-Q5_K_XL.gguf)
+      printf '%s\n' "q5"
+      ;;
+    *UD-Q4_K_M.gguf)
+      printf '%s\n' "q4m"
+      ;;
+    *UD-Q4_K_XL.gguf)
+      printf '%s\n' "q4"
+      ;;
+    *UD-Q3_K_S.gguf)
+      printf '%s\n' "q3s"
+      ;;
+    *UD-Q3_K_M.gguf)
+      printf '%s\n' "q3m"
+      ;;
+    *UD-Q3_K_XL.gguf)
+      printf '%s\n' "q3xl"
+      ;;
+    *UD-Q2_K_XL.gguf)
+      printf '%s\n' "q2"
+      ;;
+    *MXFP4_MOE.gguf)
+      printf '%s\n' "mxfp4"
+      ;;
+    *Q4_K_M.gguf)
+      printf '%s\n' "q4km"
+      ;;
+    *Q5_K_M.gguf)
+      printf '%s\n' "q5km"
+      ;;
+    *)
+      printf '%s\n' "custom"
+      ;;
+  esac
+}
+
+_llama_ctx_for_model() {
+  case "$1" in
+    Qwen3.6-35B-A3B-GGUF/*|Qwen3.5-27B-GGUF/*)
+      printf '%s\n' "$LLAMA_CPP_QWEN_CTX_SIZE"
+      ;;
+    *)
+      printf '%s\n' "$LLAMA_CPP_GEMMA_CTX_SIZE"
+      ;;
+  esac
+}
+
+_llama_curated_repo_known() {
+  local repo="$1"
+
+  _llama_curated_catalog | awk -F '\t' -v repo="$repo" '$7 == repo { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+_llama_curated_rel_known() {
+  local rel="$1"
+
+  _llama_curated_meta_for_rel "$rel" >/dev/null 2>&1
+}
+
+_llama_curated_status_for_repo_file() {
+  local repo="$1"
+  local file="$2"
+  local rel="$(_llama_rel_from_repo_and_file "$repo" "$file")"
+
+  if _llama_curated_rel_known "$rel"; then
+    printf '%s\n' "curated"
+  elif _llama_curated_repo_known "$repo"; then
+    printf '%s\n' "family-known"
+  else
+    printf '%s\n' "new"
+  fi
+}
+
+_llama_discovery_profile_name() {
+  local filter="$1"
+  local profile="${2:-current}"
+
+  case "$filter" in
+    fits-16g)
+      printf '%s\n' "mac-mini-16g"
+      ;;
+    fits-32g)
+      printf '%s\n' "balanced"
+      ;;
+    fits-48g)
+      printf '%s\n' "macbook-pro-48g"
+      ;;
+    *)
+      if [ "$profile" = "current" ] || [ -z "$profile" ]; then
+        printf '%s\n' "$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE")"
+      else
+        printf '%s\n' "$(_local_ai_profile_name "$profile")"
+      fi
+      ;;
+  esac
+}
+
+_llama_discovery_classify_repo() {
+  local repo="${1:l}"
+  local pipeline="${2:l}"
+  local tags="${3:l}"
+
+  case "$pipeline" in
+    image-text-to-text)
+      printf '%s\n' "multimodal"
+      return 0
+      ;;
+  esac
+
+  case "$tags:$repo" in
+    *vision*:*|*multimodal*:*|*:*gemma-4-*)
+      printf '%s\n' "multimodal"
+      return 0
+      ;;
+  esac
+
+  case "$tags:$repo" in
+    *reasoning*:*|*thinking*:*|*:*deepseek*|*:*qwq*|*:*qwen*|*:*r1*)
+      printf '%s\n' "reasoning"
+      ;;
+    *)
+      printf '%s\n' "general"
+      ;;
+  esac
+}
+
+_llama_discovery_pick_file() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local joined_siblings="$2"
+  local prefs=()
+  local sibling=""
+  local all_files=()
+
+  case "$profile" in
+    mac-mini-16g)
+      prefs=("UD-Q3_K_S.gguf" "UD-Q3_K_M.gguf" "UD-Q4_K_M.gguf" "UD-Q4_K_XL.gguf" "Q4_K_M.gguf" "Q8_0.gguf" "UD-Q5_K_XL.gguf")
+      ;;
+    balanced)
+      prefs=("UD-Q4_K_M.gguf" "UD-Q4_K_XL.gguf" "Q4_K_M.gguf" "UD-Q3_K_M.gguf" "Q8_0.gguf" "UD-Q5_K_XL.gguf")
+      ;;
+    *)
+      prefs=("UD-Q4_K_XL.gguf" "UD-Q5_K_XL.gguf" "UD-Q4_K_M.gguf" "Q4_K_M.gguf" "Q8_0.gguf" "UD-Q6_K_XL.gguf")
+      ;;
+  esac
+
+  for sibling in ${(s:|:)joined_siblings}; do
+    [ -n "$sibling" ] || continue
+    all_files+=("$sibling")
+  done
+
+  for sibling in "${prefs[@]}"; do
+    if printf '%s\n' "${all_files[@]}" | rg -F -m1 -- "$sibling" >/dev/null 2>&1; then
+      printf '%s\n' "$(printf '%s\n' "${all_files[@]}" | rg -F -m1 -- "$sibling")"
+      return 0
+    fi
+  done
+
+  [ ${#all_files[@]} -gt 0 ] && printf '%s\n' "${all_files[1]}"
+}
+
+_llama_discovery_estimated_bytes() {
+  local repo="$1"
+  local file="$2"
+  local class="$3"
+  local model_bytes=""
+  local mmproj_file=""
+  local mmproj_bytes=""
+  local total=0
+
+  model_bytes="$(_llama_hf_file_size_bytes "$repo" "$file" 2>/dev/null || true)"
+  case "$model_bytes" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  total="$model_bytes"
+
+  if [ "$class" = "multimodal" ]; then
+    mmproj_file="$(_llama_hf_mmproj_file_for_repo "$repo" 2>/dev/null || true)"
+    if [ -n "$mmproj_file" ]; then
+      mmproj_bytes="$(_llama_hf_file_size_bytes "$repo" "$mmproj_file" 2>/dev/null || true)"
+      case "$mmproj_bytes" in
+        ''|*[!0-9]*) ;;
+        *)
+          total=$((total + mmproj_bytes))
+          ;;
+      esac
+    fi
+  fi
+
+  printf '%s\n' "$total"
+}
+
+_llama_discovery_fit() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local repo="$2"
+  local repo_l="${2:l}"
+  local class="$3"
+  local file="$4"
+  local fit=""
+  local estimated_bytes=""
+  local size_gib=""
+
+  [ -n "$file" ] || {
+    printf '%s\n' "unknown"
+    return 0
+  }
+
+  estimated_bytes="$(_llama_discovery_estimated_bytes "$repo" "$file" "$class" 2>/dev/null || true)"
+  case "$estimated_bytes" in
+    ''|*[!0-9]*)
+      ;;
+    *)
+      size_gib="$(awk -v bytes="$estimated_bytes" 'BEGIN { printf "%.2f", bytes / (1024 * 1024 * 1024) }')"
+      case "$profile" in
+        mac-mini-16g)
+          if awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 8.5)) }'; then
+            fit="excellent"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 12.5)) }'; then
+            fit="good"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 16.5)) }'; then
+            fit="fair"
+          else
+            fit="poor"
+          fi
+          ;;
+        balanced)
+          if awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 20.0)) }'; then
+            fit="excellent"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 28.0)) }'; then
+            fit="good"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 36.0)) }'; then
+            fit="fair"
+          else
+            fit="poor"
+          fi
+          ;;
+        *)
+          if awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 30.0)) }'; then
+            fit="excellent"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 42.0)) }'; then
+            fit="good"
+          elif awk -v gib="$size_gib" 'BEGIN { exit(!(gib <= 52.0)) }'; then
+            fit="fair"
+          else
+            fit="poor"
+          fi
+          ;;
+      esac
+      ;;
+  esac
+
+  if [ -z "$fit" ]; then
+    case "$file" in
+      *Q2*|*Q3_K_S*|*Q3_K_M*)
+        fit="good"
+        ;;
+      *Q4_K_M*|*UD-Q4_K_M*|*UD-Q4_K_XL*)
+        fit="excellent"
+        ;;
+      *Q5*|*Q6*)
+        fit="good"
+        ;;
+      *Q8_0*)
+        fit="fair"
+        ;;
+      *)
+        fit="fair"
+        ;;
+    esac
+  fi
+
+  case "$profile:$repo_l:$file" in
+    mac-mini-16g:*:*)
+      case "$file" in
+        *Q2*|*Q3_K_S*|*Q3_K_M*)
+          fit="excellent"
+          ;;
+        *Q4_K_M*|*UD-Q4_K_M*|*UD-Q4_K_XL*)
+          fit="good"
+          ;;
+        *Q8_0*)
+          fit="fair"
+          ;;
+      esac
+      case "$repo_l" in
+        *35b-a3b*|*31b*|*27b*|*26b*)
+          case "$file" in
+            *Q2*|*Q3_K_S*|*Q3_K_M*)
+              fit="good"
+              ;;
+            *)
+              fit="poor"
+              ;;
+          esac
+          ;;
+        *671b*|*405b*|*123b*|*120b*|*72b*|*70b*|*v3*|*v4*)
+          fit="poor"
+          ;;
+      esac
+      ;;
+    balanced:*:*)
+      case "$file" in
+        *Q2*)
+          fit="fair"
+          ;;
+        *Q3_K_S*|*Q3_K_M*)
+          fit="good"
+          ;;
+        *Q4_K_M*|*UD-Q4_K_M*|*UD-Q4_K_XL*)
+          fit="excellent"
+          ;;
+      esac
+      case "$repo_l" in
+        *671b*|*405b*|*123b*|*120b*|*72b*|*70b*)
+          fit="poor"
+          ;;
+      esac
+      ;;
+    *)
+      case "$repo_l" in
+        *671b*|*405b*|*123b*|*120b*)
+          fit="poor"
+          ;;
+      esac
+      ;;
+  esac
+
+  case "$class:$repo_l:$file" in
+    reasoning:*deepseek-v3*:*|reasoning:*deepseek-v4*:*|multimodal:*72b*:*|multimodal:*70b*:*)
+      fit="poor"
+      ;;
+  esac
+
+  printf '%s\n' "$fit"
+}
+
+_llama_discovery_fit_score() {
+  case "$1" in
+    excellent) printf '%s\n' "5" ;;
+    good) printf '%s\n' "4" ;;
+    fair) printf '%s\n' "3" ;;
+    poor) printf '%s\n' "2" ;;
+    *) printf '%s\n' "1" ;;
+  esac
+}
+
+_llama_discovery_filter_matches() {
+  local filter="$1"
+  local class="$2"
+  local repo="$3"
+  local fit="$4"
+
+  case "$filter" in
+    all|"")
+      return 0
+      ;;
+    other|new)
+      ! _llama_curated_repo_known "$repo"
+      ;;
+    curated|known)
+      _llama_curated_repo_known "$repo"
+      ;;
+    reasoning|multimodal|general)
+      [ "$class" = "$filter" ]
+      ;;
+    fits-16g|fits-32g|fits-48g)
+      case "$fit" in
+        excellent|good)
+          return 0
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      case "$class:$repo" in
+        "$filter":*|*:"$filter"*)
+          return 0
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+}
+
+llama-discover-models() {
+  local filter="${1:-other}"
+  local requested_profile="${2:-current}"
+  local limit="${3:-${LOCAL_AI_DISCOVERY_LIMIT:-24}}"
+  local author="${LOCAL_AI_DISCOVERY_AUTHOR:-unsloth}"
+  local search="${LOCAL_AI_DISCOVERY_SEARCH:-GGUF}"
+  local profile=""
+  local json=""
+  local tmp=""
+  local id=""
+  local downloads=""
+  local likes=""
+  local updated=""
+  local pipeline=""
+  local tags=""
+  local siblings=""
+  local class=""
+  local file=""
+  local fit=""
+  local fit_score=""
+  local quant=""
+  local catalog_status=""
+  local rel=""
+  local estimated_bytes=""
+  local estimated_size=""
+  local mmproj_file=""
+  local vision_status=""
+
+  profile="$(_llama_discovery_profile_name "$filter" "$requested_profile")"
+  json="$(_llama_hf_fetch_discovery_feed "$author" "$limit" "$search" 2>/dev/null || true)"
+  [ -n "$json" ] || {
+    echo "Unable to fetch Hugging Face discovery feed"
+    return 1
+  }
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/llama-discover.XXXXXX")" || return 1
+
+  while IFS=$'\t' read -r id downloads likes updated pipeline tags siblings; do
+    [ -n "$id" ] || continue
+    [ -n "$siblings" ] || continue
+
+    class="$(_llama_discovery_classify_repo "$id" "$pipeline" "$tags")"
+    file="$(_llama_discovery_pick_file "$profile" "$siblings")"
+    rel="$(_llama_rel_from_repo_and_file "$id" "$file")"
+    fit="$(_llama_discovery_fit "$profile" "$id" "$class" "$file")"
+    _llama_discovery_filter_matches "$filter" "$class" "$id" "$fit" || continue
+
+    fit_score="$(_llama_discovery_fit_score "$fit")"
+    quant="$(_llama_quant_from_rel "$rel")"
+    catalog_status="$(_llama_curated_status_for_repo_file "$id" "$file")"
+    estimated_bytes="$(_llama_discovery_estimated_bytes "$id" "$file" "$class" 2>/dev/null || true)"
+    estimated_size="$(_llama_hf_human_size "$estimated_bytes")"
+    mmproj_file="$(_llama_hf_mmproj_file_for_repo "$id" 2>/dev/null || true)"
+    if [ "$class" = "multimodal" ]; then
+      if [ -n "$mmproj_file" ]; then
+        vision_status="ready"
+      else
+        vision_status="needs-mmproj"
+      fi
+    else
+      vision_status="text"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$fit_score" "${downloads:-0}" "$class" "$fit" "$catalog_status" "$id" "$file" "$quant" "${likes:-0}" "$updated" "${pipeline:-n/a}" "$estimated_size" "$vision_status" "$rel" >> "$tmp"
+  done < <(
+    printf '%s\n' "$json" | jq -r '
+      .[]
+      | [
+          (.id // ""),
+          ((.downloads // 0) | tostring),
+          ((.likes // 0) | tostring),
+          (.lastModified // ""),
+          (.pipeline_tag // .pipelineTag // ""),
+          ([.tags[]?] | join("|")),
+          ([.siblings[]?.rfilename
+            | select(test("\\.gguf$"; "i"))
+            | select((ascii_downcase | contains("mmproj")) | not)
+            | select(test("(^|/)(bf16|fp16|f16)/"; "i") | not)
+            | select(test("-[0-9]{5}-of-[0-9]{5}\\.gguf$"; "i") | not)
+          ] | join("|"))
+        ]
+      | @tsv
+    '
+  )
+
+  printf 'filter=%s profile=%s author=%s limit=%s\n' "$filter" "$profile" "$author" "$limit"
+  if [ ! -s "$tmp" ]; then
+    printf '  no-discovery-results\n'
+    rm -f "$tmp"
+    return 0
+  fi
+
+  sort -t $'\t' -k1,1nr -k2,2nr -k6,6 "$tmp" | awk -F '\t' '
+    {
+      printf "  %-11s %-10s status=%-11s quant=%-6s size=%-10s vision=%-11s repo=%s\n", $3, $4, $5, $8, $12, $13, $6
+      printf "             file=%s downloads=%s likes=%s updated=%s task=%s rel=%s\n", $7, $2, $9, $10, $11, $14
+      if ($5 == "new") {
+        printf "             try: llama-candidate-test %s\n", $6
+      }
+    }
+  '
+
+  rm -f "$tmp"
+}
+
+llama-curated-list() {
+  local mode="${1:-all}"
+  local custom_file="$(_llama_custom_catalog_file)"
+
+  case "$mode" in
+    custom)
+      if [ -f "$custom_file" ]; then
+        awk -F '\t' 'NF >= 7 && $0 !~ /^[[:space:]]*#/ { print $0 }' "$custom_file"
+      fi
+      ;;
+    all|"")
+      _llama_curated_catalog
+      ;;
+    *)
+      echo "Usage: llama-curated-list [all|custom]"
+      return 1
+      ;;
+  esac
+}
+
+llama-curated-add() {
+  local repo="$1"
+  local file_or_rel="$2"
+  local label="${3:-}"
+  local family="${4:-}"
+  local class="${5:-}"
+  local scope="${6:-candidate}"
+  local rel=""
+  local model_dir=""
+  local entry_id=""
+  local custom_file="$(_llama_custom_catalog_file)"
+  local quant=""
+
+  if [ -z "$repo" ] || [ -z "$file_or_rel" ]; then
+    echo "Usage: llama-curated-add <hf-repo> <gguf-file-or-relpath> [label] [family] [class] [scope]"
+    return 1
+  fi
+
+  model_dir="${repo##*/}"
+  if [[ "$file_or_rel" == */* ]]; then
+    rel="$file_or_rel"
+  else
+    rel="$model_dir/$file_or_rel"
+  fi
+
+  if _llama_curated_meta_for_rel "$rel" >/dev/null 2>&1; then
+    echo "Catalog already contains $rel"
+    return 1
+  fi
+
+  quant="$(_llama_quant_from_rel "$rel")"
+  entry_id="${model_dir:l}-${quant}"
+  entry_id="${entry_id//[^a-z0-9._-]/-}"
+
+  [ -n "$label" ] || label="${rel:t:r}"
+  if [ -z "$family" ]; then
+    case "${repo:l}" in
+      *gemma-4*)
+        family="gemma4"
+        ;;
+      *qwen3.6*)
+        family="qwen36"
+        ;;
+      *qwen3.5*)
+        family="qwen35"
+        ;;
+      *deepseek*)
+        family="deepseek"
+        ;;
+      *)
+        family="custom"
+        ;;
+    esac
+  fi
+  if [ -z "$class" ]; then
+    local hf_info="" hf_pipeline="" hf_tags=""
+    hf_info="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+    if [ -n "$hf_info" ] && command -v jq >/dev/null 2>&1; then
+      hf_pipeline="$(printf '%s' "$hf_info" | jq -r '.pipeline_tag // ""' 2>/dev/null || true)"
+      hf_tags="$(printf '%s' "$hf_info" | jq -r 'if (.tags // []) | type == "array" then (.tags | join(" ")) else "" end' 2>/dev/null || true)"
+    fi
+    class="$(_llama_discovery_classify_repo "$repo" "$hf_pipeline" "$hf_tags")"
+  fi
+
+  _local_ai_ensure_runtime_dir
+  mkdir -p "${custom_file:h}"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$entry_id" "$label" "$family" "$class" "$scope" "$rel" "$repo" >> "$custom_file"
+
+  printf 'Added curated entry to %s\n' "$custom_file"
+  printf '  id=%s\n' "$entry_id"
+  printf '  model=%s\n' "$rel"
+}
+
+_llama_candidate_pick_file() {
+  local repo="$1"
+  local requested_file="${2:-}"
+  local profile="${3:-$LLAMA_CPP_MACHINE_PROFILE}"
+  local json=""
+  local siblings=""
+
+  if [ -n "$requested_file" ]; then
+    printf '%s\n' "$requested_file"
+    return 0
+  fi
+
+  json="$(_llama_hf_fetch_model_info "$repo" 2>/dev/null || true)"
+  [ -n "$json" ] || return 1
+  siblings="$(printf '%s\n' "$json" | jq -r '
+    [.siblings[]?.rfilename
+      | select(test("\\.gguf$"; "i"))
+      | select((ascii_downcase | contains("mmproj")) | not)
+      | select(test("(^|/)(bf16|fp16|f16)/"; "i") | not)
+      | select(test("-[0-9]{5}-of-[0-9]{5}\\.gguf$"; "i") | not)
+    ] | join("|")
+  ' 2>/dev/null)"
+  [ -n "$siblings" ] || return 1
+  _llama_discovery_pick_file "$profile" "$siblings"
+}
+
+llama-pull-candidate() {
+  local repo="$1"
+  local file="${2:-}"
+  local profile="${3:-$LLAMA_CPP_MACHINE_PROFILE}"
+
+  if [ -z "$repo" ]; then
+    echo "Usage: llama-pull-candidate <hf-repo> [gguf-file] [profile]"
+    return 1
+  fi
+
+  file="$(_llama_candidate_pick_file "$repo" "$file" "$profile")" || {
+    echo "Unable to resolve a candidate file for $repo"
+    return 1
+  }
+
+  _llama_pull_repo_model "$repo" "$file"
+}
+
+llama-candidate-test() {
+  local repo="$1"
+  local file="${2:-}"
+  local profile="${3:-$LLAMA_CPP_MACHINE_PROFILE}"
+  local rel=""
+  local class=""
+  local label=""
+
+  if [ -z "$repo" ]; then
+    echo "Usage: llama-candidate-test <hf-repo> [gguf-file] [profile]"
+    return 1
+  fi
+
+  file="$(_llama_candidate_pick_file "$repo" "$file" "$profile")" || {
+    echo "Unable to resolve a candidate file for $repo"
+    return 1
+  }
+  rel="$(_llama_rel_from_repo_and_file "$repo" "$file")"
+
+  if ! _llama_curated_rel_known "$rel"; then
+    label="${rel:t:r}"
+    llama-curated-add "$repo" "$file" "$label" "" "" "candidate" >/dev/null || return 1
+  fi
+
+  llama-pull-candidate "$repo" "$file" "$profile" || return 1
+
+  if [ -x "$LLAMA_CPP_BIN/llama-bench" ]; then
+    local bench_mode bench_ctx bench_build bench_machine existing_profile
+    bench_mode="$(_llama_bench_default_mode_for_rel "$rel")"
+    bench_ctx="$(_llama_bench_context_ctx "$rel")"
+    bench_build="$(_llama_llama_cpp_build_id)"
+    bench_machine="$(_llama_bench_context_machine)"
+    existing_profile="$(_llama_bench_profile_get "$rel" "$bench_mode" "$bench_ctx" "$bench_machine" "$bench_build")"
+    if [ -z "$existing_profile" ]; then
+      llama-bench-preset "$rel" auto || return 1
+    else
+      echo "Reusing tuned profile for $rel (mode=$bench_mode ctx=$bench_ctx build=$bench_build)"
+    fi
+    llama-bench-show "$rel" || true
+  else
+    echo "Skipping benchmark: llama-bench binary not found"
+  fi
+
+  class="$(_llama_model_class_for_rel "$rel")"
+
+  if [ "$class" = "multimodal" ] && [ -x "$LLAMA_CPP_BIN/llama-mtmd-cli" ] && _llama_bench_vision_auto_enabled; then
+    local vision_existing
+    vision_existing="$(_llama_bench_vision_latest "$rel" 2>/dev/null || true)"
+    if [ -z "$vision_existing" ]; then
+      echo
+      llama-bench-vision "$rel" || echo "Vision bench failed for $rel (continuing)"
+    else
+      echo "Reusing vision bench record for $rel"
+    fi
+  fi
+
+  echo
+  llama-bench-compare "$class"
+}
+
+llama-recommendations() {
+  local requested_profile="${1:-current}"
+  local profile=""
+  local profiles=()
+  local target=""
+  local rel=""
+  local meta=""
+  local id=""
+  local label=""
+  local family=""
+  local class=""
+  local scope=""
+  local catalog_rel=""
+  local quant=""
+  local ctx=""
+  local hf_summary=""
+  local env_override=""
+  local file_override=""
+  local promoted_note=""
+  local profile_key=""
+  local preset_key=""
+  local env_var_name=""
+
+  case "$requested_profile" in
+    all)
+      profiles=("mac-mini-16g" "balanced" "macbook-pro-48g")
+      ;;
+    current|"")
+      profiles=("$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE")")
+      ;;
+    *)
+      profiles=("$(_local_ai_profile_name "$requested_profile")")
+      ;;
+  esac
+
+  for profile in "${profiles[@]}"; do
+    printf 'profile=%s\n' "$profile"
+    for target in best vision balanced fast qwen qwen27; do
+      promoted_note=""
+      case "$target" in
+        qwen27)
+          rel="Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf"
+          ;;
+        qwen)
+          rel="$(_llama_recommended_qwen36_model_for_profile "$profile")"
+          ;;
+        *)
+          rel="$(_local_ai_profile_preset_model "$profile" "$target")" || continue
+          profile_key="${(U)${profile//-/_}}"
+          preset_key="${(U)target}"
+          env_var_name="LOCAL_AI_PRESET_${profile_key}_${preset_key}_MODEL"
+          env_override="${(P)env_var_name}"
+          file_override="$(_local_ai_profile_preset_file_override "$profile" "$target" 2>/dev/null || true)"
+          if [ -n "$env_override" ]; then
+            promoted_note=" promoted=env"
+          elif [ -n "$file_override" ]; then
+            promoted_note=" promoted=file"
+          fi
+          ;;
+      esac
+
+      meta="$(_llama_curated_meta_for_rel "$rel")"
+      if [ -n "$meta" ]; then
+        IFS=$'\t' read -r id label family class scope catalog_rel <<< "$meta"
+      else
+        label="${rel:t}"
+        family="custom"
+        class="custom"
+        scope="$target"
+      fi
+
+      quant="$(_llama_quant_from_rel "$rel")"
+      case "$rel" in
+        Qwen3.6-35B-A3B-GGUF/*|Qwen3.5-27B-GGUF/*)
+          case "$profile" in
+            mac-mini-16g) ctx="16384" ;;
+            balanced) ctx="32768" ;;
+            *) ctx="65536" ;;
+          esac
+          ;;
+        *)
+          case "$profile" in
+            mac-mini-16g) ctx="16384" ;;
+            balanced) ctx="24576" ;;
+            *) ctx="32768" ;;
+          esac
+          ;;
+      esac
+
+      printf '  %-9s %-24s class=%-11s scope=%-16s quant=%-6s ctx=%-6s model=%s%s\n' \
+        "$target" "$label" "$class" "$scope" "$quant" "$ctx" "$rel" "$promoted_note"
+      hf_summary="$(_llama_hf_summary_for_rel "$rel" 2>/dev/null || true)"
+      if [ -n "$hf_summary" ]; then
+        printf '             hf=%s\n' "$hf_summary"
+      fi
+    done
+    printf '\n'
+  done
+}
+
+llama-bench-compare() {
+  local class_filter="${1:-all}"
+  local scope_filter="${2:-all}"
+  local file="$(_llama_bench_profile_file)"
+  local tmp=""
+  local id=""
+  local label=""
+  local family=""
+  local class=""
+  local scope=""
+  local rel=""
+  local record=""
+  local profile=""
+  local gen=""
+  local prompt=""
+  local updated=""
+  local installed=""
+  local mode=""
+  local ctx=""
+  local build=""
+  local machine=""
+  local vision_record=""
+  local v_load_ms="" v_encode_ms="" v_prompt_tps="" v_gen_tps="" v_updated=""
+
+  [ -f "$file" ] || {
+    echo "No tuned launch profiles recorded yet"
+    return 1
+  }
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/llama-bench-compare.XXXXXX")" || return 1
+
+  while IFS=$'\t' read -r id label family class scope rel repo; do
+    case "$class_filter" in
+      all|"")
+        ;;
+      *)
+        [ "$class" = "$class_filter" ] || continue
+        ;;
+    esac
+
+    case "$scope_filter" in
+      all|"")
+        ;;
+      *)
+        [ "$scope" = "$scope_filter" ] || continue
+        ;;
+    esac
+
+    installed="no"
+    [ -f "$LLAMA_CPP_MODELS/$rel" ] && installed="yes"
+    mode="$(_llama_bench_default_mode_for_rel "$rel")"
+    ctx="$(_llama_bench_context_ctx "$rel")"
+    build="$(_llama_llama_cpp_build_id)"
+    machine="$(_llama_bench_context_machine)"
+    record="$(_llama_bench_latest_record "$rel" "$mode" "$ctx" "$machine" "$build" 2>/dev/null || true)"
+
+    v_load_ms="-"
+    v_encode_ms="-"
+    v_prompt_tps="-"
+    v_gen_tps="-"
+    v_updated="-"
+    vision_record="$(_llama_bench_vision_latest "$rel" "$machine" "$build" 2>/dev/null || true)"
+    if [ -n "$vision_record" ]; then
+      IFS=$'\t' read -r _vm _vr _vctx _vbuild v_load_ms v_encode_ms v_prompt_tps v_gen_tps v_updated <<< "$vision_record"
+    fi
+
+    if [ -n "$record" ]; then
+      IFS=$'\t' read -r _record_machine _record_rel _record_mode _record_ctx _record_build profile gen prompt updated <<< "$record"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$gen" "$prompt" "$label" "$class" "$scope" "$profile" "$installed" "$updated" "$rel" "$_record_mode" "$_record_ctx" "$_record_build" \
+        "$v_load_ms" "$v_encode_ms" "$v_prompt_tps" "$v_gen_tps" "$v_updated" >> "$tmp"
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "-1" "-1" "$label" "$class" "$scope" "n/a" "$installed" "n/a" "$rel" "$mode" "$ctx" "$build" \
+        "$v_load_ms" "$v_encode_ms" "$v_prompt_tps" "$v_gen_tps" "$v_updated" >> "$tmp"
+    fi
+  done < <(_llama_curated_catalog)
+
+  printf 'class=%s scope=%s\n' "$class_filter" "$scope_filter"
+  awk -F '\t' '$1 != "-1"' "$tmp" | sort -t $'\t' -k1,1nr -k2,2nr | awk -F '\t' '{
+    printf "%-24s class=%-11s scope=%-16s gen=%-10s prompt=%-10s tuned=%-12s mode=%-6s ctx=%-6s installed=%-3s model=%s\n", $3, $4, $5, $1, $2, $6, $10, $11, $7, $9
+    if ($15 != "-" && $15 != "") {
+      printf "%-24s vision=         load_ms=%-7s encode_ms=%-5s prompt_tps=%-9s gen_tps=%-9s updated=%s\n", "", $13, $14, $15, $16, $17
+    }
+  }'
+
+  if awk -F '\t' '$1 == "-1" { found=1 } END { exit(found ? 0 : 1) }' "$tmp"; then
+    printf '\nmissing_benchmarks:\n'
+    awk -F '\t' '$1 == "-1" { printf "%-24s class=%-11s scope=%-16s mode=%-6s ctx=%-6s installed=%-3s model=%s\n", $3, $4, $5, $10, $11, $7, $9 }' "$tmp"
+  fi
+
+  rm -f "$tmp"
+}
+
+alias llama-compare='llama-bench-compare'
+alias llama-discover='llama-discover-models'
+alias llama-candidate='llama-candidate-test'
+alias llama-promote='llama-curated-promote'
 
 llama-update-safe() {
   local backup_dir=""
@@ -604,6 +2243,10 @@ llama-start() {
   local safe_retry_args_str=""
   local launch_args=()
   local retry_args=()
+  local tuned_mode=""
+  local tuned_ctx=""
+  local tuned_build=""
+  local tuned_machine=""
   if [ $# -gt 0 ]; then
     shift
   fi
@@ -618,11 +2261,15 @@ llama-start() {
   llama-stop >/dev/null 2>&1 || true
 
   if _llama_tuned_profile_enabled; then
-    tuned_profile="$(_llama_bench_profile_get "$model")"
+    tuned_mode="$(_llama_bench_mode_for_rel_and_args "$model" "$@")"
+    tuned_ctx="$(_llama_bench_context_ctx "$model")"
+    tuned_build="$(_llama_llama_cpp_build_id)"
+    tuned_machine="$(_llama_bench_context_machine)"
+    tuned_profile="$(_llama_bench_profile_get "$model" "$tuned_mode" "$tuned_ctx" "$tuned_machine" "$tuned_build")"
     if [ -n "$tuned_profile" ]; then
       tuned_args_str="$(_llama_server_profile_args "$tuned_profile")"
       launch_args+=(${(z)tuned_args_str})
-      echo "Using tuned launch profile '$tuned_profile' for $model"
+      echo "Using tuned launch profile '$tuned_profile' for $model (machine=$tuned_machine mode=$tuned_mode ctx=$tuned_ctx build=$tuned_build)"
     else
       launch_args+=(${(z)$(_llama_server_profile_args default)})
     fi
@@ -981,9 +2628,46 @@ llama-pull-file() {
     return 1
   fi
 
-  target="$LLAMA_CPP_MODELS/${repo##*/}"
+  _llama_pull_repo_model "$repo" "$file"
+}
+
+_llama_pull_repo_model() {
+  local repo="$1"
+  local file="$2"
+  local rel="$(_llama_rel_from_repo_and_file "$repo" "$file")"
+  local target="$LLAMA_CPP_MODELS/${repo##*/}"
+  local was_missing=0
+  local class=""
+  local mmproj_file=""
+
+  if [ -z "$repo" ] || [ -z "$file" ]; then
+    echo "Usage: _llama_pull_repo_model <hf-repo> <filename.gguf>"
+    return 1
+  fi
+
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
   mkdir -p "$target"
-  hf download "$repo" "$file" --local-dir "$target"
+
+  class="$(_llama_model_class_for_rel "$rel")"
+  case "$class" in
+    general|custom|"")
+      class="$(_llama_discovery_classify_repo "$repo" "" "")"
+      ;;
+  esac
+
+  mmproj_file="$(_llama_hf_mmproj_file_for_repo "$repo" 2>/dev/null || true)"
+  if [ -n "$mmproj_file" ]; then
+    hf download "$repo" \
+      "$file" \
+      "$mmproj_file" \
+      --local-dir "$target"
+  else
+    hf download "$repo" \
+      "$file" \
+      --local-dir "$target"
+  fi
+
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
 _llama_auto_tune_on_pull_enabled() {
@@ -1001,6 +2685,9 @@ _llama_maybe_tune_after_pull() {
   local rel="$1"
   local was_missing="${2:-0}"
   local profile=""
+  local mode=""
+  local ctx=""
+  local build=""
 
   if [ "$was_missing" -ne 1 ]; then
     return 0
@@ -1013,15 +2700,55 @@ _llama_maybe_tune_after_pull() {
     return 0
   fi
 
-  profile="$(_llama_bench_profile_get "$rel")"
+  mode="$(_llama_bench_default_mode_for_rel "$rel")"
+  ctx="$(_llama_bench_context_ctx "$rel")"
+  build="$(_llama_llama_cpp_build_id)"
+  profile="$(_llama_bench_profile_get "$rel" "$mode" "$ctx" "$(_llama_bench_context_machine)" "$build")"
   if [ -n "$profile" ]; then
-    echo "Tuned launch profile already exists for $rel"
+    echo "Tuned launch profile already exists for $rel (mode=$mode ctx=$ctx build=$build)"
     return 0
   fi
 
   echo "Running auto-tune benchmark for $rel..."
-  llama-bench-preset "$rel" || {
+  llama-bench-preset "$rel" "$mode" || {
     echo "Auto-tune benchmark failed for $rel"
+    return 0
+  }
+
+  _llama_maybe_vision_bench_after_pull "$rel"
+}
+
+_llama_maybe_vision_bench_after_pull() {
+  local rel="$1"
+  local class=""
+  local mmproj=""
+  local machine=""
+  local build=""
+  local existing=""
+
+  _llama_bench_vision_auto_enabled || return 0
+
+  if [ ! -x "$LLAMA_CPP_BIN/llama-mtmd-cli" ]; then
+    return 0
+  fi
+
+  class="$(_llama_model_class_for_rel "$rel")"
+  [ "$class" = "multimodal" ] || return 0
+
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/${rel%/*}" "$rel" 2>/dev/null || true)"
+  [ -n "$mmproj" ] || return 0
+
+  machine="$(_llama_bench_context_machine)"
+  build="$(_llama_llama_cpp_build_id)"
+  existing="$(_llama_bench_vision_latest "$rel" "$machine" "$build" 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    echo "Vision bench record already exists for $rel (machine=$machine build=$build)"
+    return 0
+  fi
+
+  echo "Running vision bench for $rel (class=multimodal, mmproj present)..."
+  llama-bench-vision "$rel" || {
+    echo "Vision bench failed for $rel"
     return 0
   }
 }
@@ -1080,6 +2807,139 @@ llama-clean() {
   find "$LLAMA_CPP_CACHE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
 
+llama-uninstall() {
+  local rel=""
+  local force=0
+  local arg=""
+  local dir=""
+  local model_path=""
+  local model_dir=""
+  local scope=""
+  local tmp=""
+  local bench_profile_file=""
+  local bench_history_file=""
+  local custom_file=""
+  local overrides_file=""
+  local remaining_ggufs=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f)
+        force=1
+        ;;
+      -h|--help)
+        echo "Usage: llama-uninstall <rel> [--force]"
+        echo "  Removes a pulled model file plus its mmproj sibling when no other GGUF remains,"
+        echo "  prunes its bench profile/history rows, and removes custom-catalog candidate entries."
+        echo "  Curated scopes (non-candidate) and promotion overrides require --force."
+        return 0
+        ;;
+      -*)
+        echo "Unknown flag: $arg"
+        return 1
+        ;;
+      *)
+        if [ -z "$rel" ]; then
+          rel="$arg"
+        else
+          echo "Usage: llama-uninstall <rel> [--force]"
+          return 1
+        fi
+        ;;
+    esac
+  done
+
+  if [ -z "$rel" ]; then
+    echo "Usage: llama-uninstall <rel> [--force]"
+    return 1
+  fi
+
+  dir="${rel%%/*}"
+  model_path="$LLAMA_CPP_MODELS/$rel"
+  model_dir="$LLAMA_CPP_MODELS/$dir"
+
+  if [ -z "$dir" ] || [ "$dir" = "$rel" ]; then
+    echo "Expected rel of form <repo-dir>/<file.gguf>, got: $rel"
+    return 1
+  fi
+
+  scope="$(_llama_curated_field_for_rel "$rel" 5)"
+  if [ -z "$scope" ] && [ ! -f "$model_path" ]; then
+    echo "No catalog entry and no file on disk for $rel"
+    return 1
+  fi
+
+  case "$scope" in
+    candidate|"")
+      ;;
+    *)
+      if [ "$force" -ne 1 ]; then
+        echo "Refusing to uninstall $rel: scope=$scope (use --force to override)"
+        return 1
+      fi
+      ;;
+  esac
+
+  echo "Uninstalling $rel (scope=${scope:-unknown}, force=$force)"
+
+  if [ -f "$model_path" ]; then
+    rm -f "$model_path"
+    echo "  removed $model_path"
+  fi
+
+  if [ -d "$model_dir" ] && [ -n "$LLAMA_CPP_MODELS" ] && [[ "$model_dir" == "$LLAMA_CPP_MODELS"/* ]]; then
+    remaining_ggufs="$(find "$model_dir" -maxdepth 2 -type f -iname '*.gguf' ! -iname 'mmproj*' 2>/dev/null | head -1)"
+    if [ -z "$remaining_ggufs" ]; then
+      rm -rf "$model_dir"
+      if [ ! -e "$model_dir" ]; then
+        echo "  removed empty dir $model_dir (including mmproj + hf cache)"
+      fi
+    fi
+  fi
+
+  bench_profile_file="$(_llama_bench_profile_file)"
+  if [ -f "$bench_profile_file" ]; then
+    tmp="$(mktemp)" || return 1
+    awk -F '\t' -v rel="$rel" '$1 != rel && $2 != rel' "$bench_profile_file" > "$tmp" && mv "$tmp" "$bench_profile_file"
+    [ -s "$bench_profile_file" ] || rm -f "$bench_profile_file"
+    echo "  pruned bench profile rows for $rel"
+  fi
+
+  bench_history_file="$(_llama_bench_history_file)"
+  if [ -f "$bench_history_file" ]; then
+    tmp="$(mktemp)" || return 1
+    awk -F '\t' -v rel="$rel" '$2 != rel && $3 != rel' "$bench_history_file" > "$tmp" && mv "$tmp" "$bench_history_file"
+    [ -s "$bench_history_file" ] || rm -f "$bench_history_file"
+    echo "  pruned bench history rows for $rel"
+  fi
+
+  local bench_vision_file="$(_llama_bench_vision_file)"
+  if [ -f "$bench_vision_file" ]; then
+    tmp="$(mktemp)" || return 1
+    awk -F '\t' -v rel="$rel" '$2 != rel' "$bench_vision_file" > "$tmp" && mv "$tmp" "$bench_vision_file"
+    [ -s "$bench_vision_file" ] || rm -f "$bench_vision_file"
+    echo "  pruned vision bench rows for $rel"
+  fi
+
+  custom_file="$(_llama_custom_catalog_file)"
+  if [ -f "$custom_file" ]; then
+    tmp="$(mktemp)" || return 1
+    awk -F '\t' -v rel="$rel" '$6 != rel' "$custom_file" > "$tmp" && mv "$tmp" "$custom_file"
+    [ -s "$custom_file" ] || rm -f "$custom_file"
+    echo "  pruned custom catalog entries for $rel"
+  fi
+
+  if [ "$force" -eq 1 ]; then
+    overrides_file="$(_local_ai_preset_overrides_file)"
+    if [ -f "$overrides_file" ]; then
+      tmp="$(mktemp)" || return 1
+      awk -F '\t' -v rel="$rel" '$3 != rel' "$overrides_file" > "$tmp" && mv "$tmp" "$overrides_file"
+      [ -s "$overrides_file" ] || rm -f "$overrides_file"
+      echo "  pruned promotion overrides for $rel"
+    fi
+  fi
+}
+
 _llama_start_gemma4_model() {
   local rel="$1"
   local model_dir="$2"
@@ -1121,6 +2981,46 @@ _llama_default_e4b_model() {
   done
 
   printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+}
+
+_llama_recommended_qwen36_model_for_profile() {
+  local profile="$(_local_ai_profile_name "$1")"
+
+  case "$profile" in
+    mac-mini-16g)
+      printf '%s\n' "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf"
+      ;;
+    balanced)
+      printf '%s\n' "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+      ;;
+    *)
+      printf '%s\n' "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+      ;;
+  esac
+}
+
+_llama_default_qwen36_model() {
+  local candidate="$(_llama_recommended_qwen36_model_for_profile "$LLAMA_CPP_MACHINE_PROFILE")"
+  local rel=""
+
+  if [ -f "$LLAMA_CPP_MODELS/$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for rel in \
+    "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" \
+    "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" \
+    "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf" \
+    "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf"
+  do
+    if [ -f "$LLAMA_CPP_MODELS/$rel" ]; then
+      printf '%s\n' "$rel"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "$candidate"
 }
 
 run-gemma4-e4b() {
@@ -1314,20 +3214,24 @@ llama-profile() {
     current)
       echo "LLAMA_CPP_MACHINE_PROFILE=$LLAMA_CPP_MACHINE_PROFILE"
       echo "LLAMA_CPP_GEMMA_CTX_SIZE=$LLAMA_CPP_GEMMA_CTX_SIZE"
+      echo "LLAMA_CPP_QWEN_CTX_SIZE=$LLAMA_CPP_QWEN_CTX_SIZE"
       echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
       return 0
       ;;
     mac-mini-16g|mini|16g)
       export LLAMA_CPP_MACHINE_PROFILE="mac-mini-16g"
       export LLAMA_CPP_GEMMA_CTX_SIZE="16384"
+      export LLAMA_CPP_QWEN_CTX_SIZE="16384"
       ;;
     balanced|mid)
       export LLAMA_CPP_MACHINE_PROFILE="balanced"
       export LLAMA_CPP_GEMMA_CTX_SIZE="24576"
+      export LLAMA_CPP_QWEN_CTX_SIZE="32768"
       ;;
     macbook-pro-48g|macbook-pro|mbp|laptop|desktop-48g|desktop|48g|best)
       export LLAMA_CPP_MACHINE_PROFILE="macbook-pro-48g"
       export LLAMA_CPP_GEMMA_CTX_SIZE="32768"
+      export LLAMA_CPP_QWEN_CTX_SIZE="65536"
       ;;
     *)
       echo "Usage: llama-profile {mini|balanced|macbook-pro|current}"
@@ -1345,6 +3249,7 @@ llama-profile() {
 
   echo "LLAMA_CPP_MACHINE_PROFILE=$LLAMA_CPP_MACHINE_PROFILE"
   echo "LLAMA_CPP_GEMMA_CTX_SIZE=$LLAMA_CPP_GEMMA_CTX_SIZE"
+  echo "LLAMA_CPP_QWEN_CTX_SIZE=$LLAMA_CPP_QWEN_CTX_SIZE"
   echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
 }
 
@@ -1368,7 +3273,7 @@ llama-switch() {
     current)
       _local_ai_run_llama_cpp_source "$(_local_ai_source_model)"
       ;;
-    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
+    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b|qwen27|qwen35|qwen3.5-27b|*.gguf|*/*)
       rel="$(_local_ai_resolve_model_target "$target")" || return 1
       if _local_ai_is_named_preset "$target"; then
         _local_ai_ensure_model_assets "$rel" || return 1
@@ -1377,7 +3282,7 @@ llama-switch() {
       _local_ai_run_llama_cpp_source "$rel"
       ;;
     *)
-      echo "Usage: llama-switch {best|vision|balanced|fast|31b|26b|e4b|qwen27|current|<relative-model-path>}"
+      echo "Usage: llama-switch {best|vision|balanced|fast|31b|26b|e4b|qwen|qwen27|current|<relative-model-path>}"
       return 1
       ;;
   esac
@@ -1412,7 +3317,7 @@ llama-use() {
   esac
 
   case "$target" in
-    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+    best|quality|vision|image|balanced|daily|fast|small|31b|gemma4-31b|gemma-4-31b|26b|gemma4-26b|gemma-4-26b|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b|qwen27|qwen35|qwen3.5-27b)
       rel="$(_local_ai_resolve_model_target "$target")" || return 1
       _llama_switch_default_model "$rel"
       ;;
@@ -1420,7 +3325,7 @@ llama-use() {
       echo "LLAMA_CPP_DEFAULT_MODEL=$LLAMA_CPP_DEFAULT_MODEL"
       ;;
     *)
-      echo "Usage: llama-use {best|vision|balanced|fast|31b|26b|e4b|qwen27|current}"
+      echo "Usage: llama-use {best|vision|balanced|fast|31b|26b|e4b|qwen|qwen27|current}"
       return 1
       ;;
   esac
@@ -1622,6 +3527,76 @@ llama-pull-qwen35-27b-q5() {
   _llama_maybe_tune_after_pull "$rel" "$was_missing"
 }
 
+llama-pull-qwen36-35b() {
+  local target="$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF"
+  local quant="${1:-recommended}"
+  local model_file=""
+  local rel=""
+  local was_missing=0
+
+  if [ "$quant" = "recommended" ] || [ "$quant" = "default" ] || [ "$quant" = "auto" ]; then
+    quant="$(_llama_recommended_quant_for_target qwen)"
+  fi
+
+  case "$quant" in
+    q2|q2xl)
+      model_file="Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf"
+      ;;
+    q3s)
+      model_file="Qwen3.6-35B-A3B-UD-Q3_K_S.gguf"
+      ;;
+    q3m)
+      model_file="Qwen3.6-35B-A3B-UD-Q3_K_M.gguf"
+      ;;
+    q3xl)
+      model_file="Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
+      ;;
+    q4m)
+      model_file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+      ;;
+    q4|q4xl|4bit|recommended|default)
+      model_file="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+      ;;
+    q5)
+      model_file="Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf"
+      ;;
+    q6)
+      model_file="Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+      ;;
+    q8|8bit)
+      model_file="Qwen3.6-35B-A3B-Q8_0.gguf"
+      ;;
+    mxfp4)
+      model_file="Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+      ;;
+    *.gguf)
+      model_file="$quant"
+      ;;
+    *)
+      echo "Usage: llama-pull-qwen36-35b [q2|q3s|q3m|q3xl|q4|q4m|q5|q6|q8|mxfp4|<filename.gguf>]"
+      return 1
+      ;;
+  esac
+
+  rel="Qwen3.6-35B-A3B-GGUF/$model_file"
+  [ -f "$LLAMA_CPP_MODELS/$rel" ] || was_missing=1
+  mkdir -p "$target"
+  hf download unsloth/Qwen3.6-35B-A3B-GGUF \
+    "$model_file" \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+  _llama_maybe_tune_after_pull "$rel" "$was_missing"
+}
+
+llama-pull-qwen36-35b-mmproj() {
+  local target="$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF"
+
+  mkdir -p "$target"
+  hf download unsloth/Qwen3.6-35B-A3B-GGUF \
+    mmproj-BF16.gguf \
+    --local-dir "$target"
+}
+
 run-qwen35-27b() {
   local model="${1:-Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf}"
   local temp="0.7"
@@ -1641,6 +3616,58 @@ run-qwen35-27b() {
     --top-k 20 \
     --presence-penalty 1.5 \
     --chat-template-kwargs "$(_local_ai_chat_template_kwargs)"
+}
+
+_local_ai_qwen_chat_template_kwargs() {
+  local preserve="false"
+
+  if _local_ai_thinking_enabled; then
+    case "${LOCAL_AI_PRESERVE_THINKING:-true}" in
+      0|false|FALSE|no|NO|off|OFF)
+        preserve="false"
+        ;;
+      *)
+        preserve="true"
+        ;;
+    esac
+
+    printf '%s\n' "{\"enable_thinking\":true,\"preserve_thinking\":${preserve}}"
+    return 0
+  fi
+
+  printf '%s\n' '{"enable_thinking":false,"preserve_thinking":false}'
+}
+
+run-qwen36-35b() {
+  local model="${1:-$(_llama_default_qwen36_model)}"
+  local mmproj=""
+  local temp="0.7"
+  local top_p="0.8"
+  local presence_penalty="1.5"
+
+  _local_ai_ensure_model_assets "$model" || return 1
+
+  mmproj="$(_llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$model")" || {
+    echo "No Qwen 3.6 35B-A3B mmproj file found under $LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF"
+    return 1
+  }
+
+  if _local_ai_thinking_enabled; then
+    temp="0.6"
+    top_p="0.95"
+    presence_penalty="0.0"
+  fi
+
+  llama-start "$model" \
+    --mmproj "$mmproj" \
+    --ctx-size "$LLAMA_CPP_QWEN_CTX_SIZE" \
+    --temp "$temp" \
+    --top-p "$top_p" \
+    --top-k 20 \
+    --min-p 0.0 \
+    --presence-penalty "$presence_penalty" \
+    --repeat-penalty 1.0 \
+    --chat-template-kwargs "$(_local_ai_qwen_chat_template_kwargs)"
 }
 
 run-gemma4-31b() {
@@ -1690,16 +3717,24 @@ llama-thinking() {
     off|disable|disabled|false|instruct|non-thinking|nonthinking)
       export LOCAL_AI_ENABLE_THINKING="false"
       ;;
+    preserve-on|preserve|retain|keep)
+      export LOCAL_AI_PRESERVE_THINKING="true"
+      ;;
+    preserve-off|drop|discard)
+      export LOCAL_AI_PRESERVE_THINKING="false"
+      ;;
     current|"")
       ;;
     *)
-      echo "Usage: llama-thinking {on|off|current}"
+      echo "Usage: llama-thinking {on|off|preserve-on|preserve-off|current}"
       return 1
       ;;
   esac
 
   echo "LOCAL_AI_ENABLE_THINKING=$LOCAL_AI_ENABLE_THINKING"
+  echo "LOCAL_AI_PRESERVE_THINKING=$LOCAL_AI_PRESERVE_THINKING"
   echo "LLAMA_CHAT_TEMPLATE_KWARGS=$(_local_ai_chat_template_kwargs)"
+  echo "QWEN_CHAT_TEMPLATE_KWARGS=$(_local_ai_qwen_chat_template_kwargs)"
 }
 
 _local_ai_profile_name() {
@@ -1721,18 +3756,40 @@ _local_ai_profile_name() {
   esac
 }
 
+_local_ai_preset_overrides_file() {
+  printf '%s\n' "${LOCAL_AI_PRESET_OVERRIDES_FILE:-$LOCAL_AI_RUNTIME_DIR/preset-overrides.tsv}"
+}
+
+_local_ai_profile_preset_file_override() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local preset="$2"
+  local file="$(_local_ai_preset_overrides_file)"
+
+  [ -f "$file" ] || return 1
+  awk -F '\t' -v profile="$profile" -v preset="$preset" '$1 == profile && $2 == preset { print $3; found = 1 } END { exit(found ? 0 : 1) }' "$file" | tail -n 1
+}
+
 _local_ai_profile_preset_override() {
   local profile="$(_local_ai_profile_name "$1")"
   local preset="$2"
   local profile_key="${profile//-/_}"
   local preset_key="$preset"
   local var_name="LOCAL_AI_PRESET_${profile_key}_${preset_key}_MODEL"
+  local env_override=""
+  local file_override=""
 
   profile_key="${(U)profile_key}"
   preset_key="${(U)preset_key}"
   var_name="LOCAL_AI_PRESET_${profile_key}_${preset_key}_MODEL"
 
-  printf '%s\n' "${(P)var_name}"
+  env_override="${(P)var_name}"
+  if [ -n "$env_override" ]; then
+    printf '%s\n' "$env_override"
+    return 0
+  fi
+
+  file_override="$(_local_ai_profile_preset_file_override "$profile" "$preset" 2>/dev/null || true)"
+  [ -n "$file_override" ] && printf '%s\n' "$file_override"
 }
 
 _local_ai_profile_preset_model() {
@@ -1774,9 +3831,70 @@ _local_ai_profile_preset_model() {
   esac
 }
 
+_local_ai_profile_preset_set() {
+  local profile="$(_local_ai_profile_name "$1")"
+  local preset="$2"
+  local rel="$3"
+  local file="$(_local_ai_preset_overrides_file)"
+  local tmp=""
+
+  _local_ai_ensure_runtime_dir
+  mkdir -p "${file:h}"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/preset-overrides.XXXXXX")" || return 1
+
+  if [ -f "$file" ]; then
+    awk -F '\t' -v profile="$profile" -v preset="$preset" '!( $1 == profile && $2 == preset ) { print $0 }' "$file" > "$tmp"
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$profile" "$preset" "$rel" "$(date +%Y-%m-%dT%H:%M:%S%z)" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+llama-curated-promotions() {
+  local file="$(_local_ai_preset_overrides_file)"
+
+  if [ ! -f "$file" ]; then
+    echo "No preset promotions recorded"
+    return 1
+  fi
+
+  awk -F '\t' '{ printf "profile=%s preset=%s model=%s updated_at=%s\n", $1, $2, $3, $4 }' "$file"
+}
+
+llama-curated-promote() {
+  local profile="${1:-$LLAMA_CPP_MACHINE_PROFILE}"
+  local preset="$2"
+  local target="$3"
+  local rel=""
+
+  case "$preset" in
+    best|vision|balanced|fast)
+      ;;
+    *)
+      echo "Usage: llama-curated-promote <profile> <best|vision|balanced|fast> <model-target>"
+      return 1
+      ;;
+  esac
+
+  if [ -z "$target" ]; then
+    echo "Usage: llama-curated-promote <profile> <best|vision|balanced|fast> <model-target>"
+    return 1
+  fi
+
+  if [[ "$target" == *.gguf ]] || [[ "$target" == */* ]]; then
+    rel="$target"
+  else
+    rel="$(_local_ai_resolve_model_target "$target")" || return 1
+  fi
+
+  _local_ai_profile_preset_set "$profile" "$preset" "$rel" || return 1
+  echo "Promoted $rel"
+  echo "profile=$(_local_ai_profile_name "$profile") preset=$preset"
+}
+
 _local_ai_is_named_preset() {
   case "$1" in
-    best|quality|vision|image|31b|gemma4-31b|gemma-4-31b|balanced|daily|26b|gemma4-26b|gemma-4-26b|fast|small|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen27|qwen3.5-27b)
+    best|quality|vision|image|31b|gemma4-31b|gemma-4-31b|balanced|daily|26b|gemma4-26b|gemma-4-26b|fast|small|e4b|gemma4-e4b|gemma-4-e4b|qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b|qwen27|qwen35|qwen3.5-27b)
       return 0
       ;;
     *)
@@ -1868,7 +3986,10 @@ _local_ai_resolve_model_target() {
     e4b|gemma4-e4b|gemma-4-e4b)
       printf '%s\n' "gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
       ;;
-    qwen|qwen27|qwen3.5-27b)
+    qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b)
+      _llama_recommended_qwen36_model_for_profile "$LLAMA_CPP_MACHINE_PROFILE"
+      ;;
+    qwen27|qwen35|qwen3.5-27b)
       printf '%s\n' "Qwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf"
       ;;
     *.gguf|*/*)
@@ -1901,7 +4022,21 @@ _llama_recommended_quant_for_target() {
       fi
       return 0
       ;;
-    qwen|qwen27|qwen3.5-27b)
+    qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b)
+      case "$profile" in
+        mac-mini-16g)
+          printf '%s\n' "q3s"
+          ;;
+        balanced)
+          printf '%s\n' "q4m"
+          ;;
+        *)
+          printf '%s\n' "q4"
+          ;;
+      esac
+      return 0
+      ;;
+    qwen27|qwen35|qwen3.5-27b)
       printf '%s\n' "q5"
       return 0
       ;;
@@ -1953,6 +4088,36 @@ _llama_recommended_quant_for_target() {
     gemma-4-E4B-it-GGUF/*)
       printf '%s\n' "q4"
       ;;
+    Qwen3.6-35B-A3B-GGUF/*Q8_0.gguf)
+      printf '%s\n' "q8"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*MXFP4_MOE.gguf)
+      printf '%s\n' "mxfp4"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q6*.gguf)
+      printf '%s\n' "q6"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q5*.gguf)
+      printf '%s\n' "q5"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q4_K_M.gguf)
+      printf '%s\n' "q4m"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q4*.gguf)
+      printf '%s\n' "q4"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q3_K_S.gguf)
+      printf '%s\n' "q3s"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q3_K_M.gguf)
+      printf '%s\n' "q3m"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q3*.gguf)
+      printf '%s\n' "q3xl"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*Q2*.gguf)
+      printf '%s\n' "q2"
+      ;;
     Qwen3.5-27B-GGUF/*)
       printf '%s\n' "q5"
       ;;
@@ -1995,6 +4160,9 @@ llama-pull-recommended() {
       ;;
     gemma-4-E4B-it-GGUF/*)
       llama-pull-gemma4-e4b "$quant"
+      ;;
+    Qwen3.6-35B-A3B-GGUF/*)
+      llama-pull-qwen36-35b "$quant"
       ;;
     Qwen3.5-27B-GGUF/*)
       llama-pull-qwen35-27b-q5
@@ -2170,10 +4338,86 @@ _local_ai_ensure_model_assets() {
         llama-pull-qwen35-27b-q5 || return 1
       fi
       ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q3_K_S model..."
+        llama-pull-qwen36-35b q3s || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q4_K_M model..."
+        llama-pull-qwen36-35b q4m || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q4_K_XL model..."
+        llama-pull-qwen36-35b q4 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q5_K_XL model..."
+        llama-pull-qwen36-35b q5 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q6_K_XL model..."
+        llama-pull-qwen36-35b q6 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
+    Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q8_0.gguf)
+      if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
+        echo "Pulling missing Qwen 3.6 35B-A3B Q8_0 model..."
+        llama-pull-qwen36-35b q8 || return 1
+      fi
+
+      if ! _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1; then
+        echo "Pulling missing Qwen 3.6 35B-A3B mmproj..."
+        llama-pull-qwen36-35b-mmproj || return 1
+      fi
+      ;;
     *)
       if [ ! -f "$LLAMA_CPP_MODELS/$rel" ]; then
-        echo "Model not found: $LLAMA_CPP_MODELS/$rel"
-        return 1
+        local repo=""
+        local file=""
+
+        repo="$(_llama_hf_repo_for_rel "$rel" 2>/dev/null || true)"
+        if [ -n "$repo" ]; then
+          file="${rel#*/}"
+          echo "Pulling missing catalog model from $repo..."
+          _llama_pull_repo_model "$repo" "$file" || return 1
+        else
+          echo "Model not found: $LLAMA_CPP_MODELS/$rel"
+          return 1
+        fi
       fi
       ;;
   esac
@@ -2181,6 +4425,7 @@ _local_ai_ensure_model_assets() {
 
 _local_ai_llama_cpp_model_runnable() {
   local rel="$1"
+  local class=""
 
   case "$rel" in
     gemma-4-31B-it-GGUF/*)
@@ -2195,8 +4440,18 @@ _local_ai_llama_cpp_model_runnable() {
       [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
       _llama_find_mmproj "$LLAMA_CPP_MODELS/gemma-4-E4B-it-GGUF" >/dev/null 2>&1
       ;;
+    Qwen3.6-35B-A3B-GGUF/*)
+      [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
+      _llama_find_mmproj "$LLAMA_CPP_MODELS/Qwen3.6-35B-A3B-GGUF" "$rel" >/dev/null 2>&1
+      ;;
     *)
-      [ -f "$LLAMA_CPP_MODELS/$rel" ]
+      [ -f "$LLAMA_CPP_MODELS/$rel" ] || return 1
+      class="$(_llama_model_class_for_rel "$rel")"
+      if [ "$class" = "multimodal" ]; then
+        _llama_find_mmproj "$LLAMA_CPP_MODELS/${rel%/*}" "$rel" >/dev/null 2>&1
+      else
+        return 0
+      fi
       ;;
   esac
 }
@@ -2223,28 +4478,28 @@ _local_ai_resolve_llama_cpp_target() {
 
       case "$(_local_ai_profile_name "$LLAMA_CPP_MACHINE_PROFILE"):$target" in
         mac-mini-16g:best|mac-mini-16g:quality)
-          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
           ;;
         mac-mini-16g:vision|mac-mini-16g:image)
           candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
           ;;
         mac-mini-16g:balanced|mac-mini-16g:daily)
-          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_S.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
           ;;
         mac-mini-16g:fast|mac-mini-16g:small)
           candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf'
           ;;
         *:best|*:quality)
-          candidates=$'gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
+          candidates=$'gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf\nQwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf'
           ;;
         *:vision|*:image)
           candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
           ;;
         *:balanced|*:daily)
-          candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
+          candidates=$'gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\nQwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf\ngemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
           ;;
         *)
-          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
+          candidates=$'gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf\nQwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf\nQwen3.5-27B-GGUF/Qwen3.5-27B-UD-Q5_K_XL.gguf\ngemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf\ngemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q4_K_XL.gguf'
           ;;
       esac
 
@@ -2258,7 +4513,7 @@ _local_ai_resolve_llama_cpp_target() {
         fi
       done
       ;;
-    qwen|qwen27|qwen3.5-27b|*.gguf|*/*)
+    qwen|qwen36|qwen3.6|qwen3.6-35b|qwen35b|qwen27|qwen35|qwen3.5-27b|*.gguf|*/*)
       requested="$(_local_ai_resolve_model_target "$target")" || return 1
       if _local_ai_llama_cpp_model_runnable "$requested"; then
         printf '%s\n' "$requested"
@@ -2290,6 +4545,9 @@ _local_ai_run_llama_cpp_source() {
     gemma-4-E4B-it-GGUF/*)
       run-gemma4-e4b "$rel"
       ;;
+    Qwen3.6-35B-A3B-GGUF/*)
+      run-qwen36-35b "$rel"
+      ;;
     Qwen3.5-27B-GGUF/*)
       run-qwen35-27b "$rel"
       ;;
@@ -2302,7 +4560,14 @@ _local_ai_run_llama_cpp_source() {
 _local_ai_sync_env() {
   local source_model="$(_local_ai_source_model)"
 
-  export LOCAL_AI_CONTEXT_LENGTH="$LLAMA_CPP_GEMMA_CTX_SIZE"
+  case "$source_model" in
+    Qwen3.6-35B-A3B-GGUF/*|Qwen3.5-27B-GGUF/*)
+      export LOCAL_AI_CONTEXT_LENGTH="$LLAMA_CPP_QWEN_CTX_SIZE"
+      ;;
+    *)
+      export LOCAL_AI_CONTEXT_LENGTH="$LLAMA_CPP_GEMMA_CTX_SIZE"
+      ;;
+  esac
 
   case "$LOCAL_AI_PROVIDER" in
     lmstudio)
@@ -2548,6 +4813,13 @@ local-ai-status() {
   echo "LOCAL_AI_CONTEXT_LENGTH: $LOCAL_AI_CONTEXT_LENGTH"
   echo "Local AI server:         $reachability"
 
+  local overrides_file="$(_local_ai_preset_overrides_file)"
+  local override_count=0
+  if [ -f "$overrides_file" ]; then
+    override_count="$(awk 'NF' "$overrides_file" | wc -l | tr -d ' ')"
+  fi
+  echo "Preset promotions:       $override_count (file=$overrides_file)"
+
   if [ "$LOCAL_AI_PROVIDER" = "lmstudio" ]; then
     echo "LM Studio imported:      $imported"
   fi
@@ -2628,6 +4900,11 @@ alias gemma4-31b-mmproj-pull='llama-pull-gemma4-31b-mmproj'
 alias gemma4-26b-pull='llama-pull-gemma4-26b'
 alias gemma4-26b-mmproj-pull='llama-pull-gemma4-26b-mmproj'
 alias gemma4-e4b-pull='llama-pull-gemma4-e4b'
+alias qwen='llama-switch qwen'
+alias qwen36='llama-switch qwen'
+alias qwen-pull='llama-pull-recommended qwen'
+alias qwen36-pull='llama-pull-qwen36-35b'
+alias qwen36-mmproj-pull='llama-pull-qwen36-35b-mmproj'
 alias qwen27-pull='llama-pull-qwen35-27b-q5'
 alias llama-thinking-on='llama-thinking on'
 alias llama-thinking-off='llama-thinking off'
